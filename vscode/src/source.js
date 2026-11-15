@@ -176,9 +176,14 @@ export function blankMargins(text, language) {
   }
   /** @param {string} line */
   const isProcess = (line) => /^[*%]PROCESS/i.test(line);
-  const carriageControl = language === "pli" && code.every((line) => isProcess(line) || " 01-+".includes(line[0]));
   const numbered = code.filter((line) => line.slice(72).trim()).length;
   const blankSequence = numbered * 10 >= code.length * 9;
+  // The compiler reads from column 2. A numbered member is fixed-format, so
+  // column 1 goes whatever it holds; otherwise only when what is there stands
+  // alone (`X  DCL`, a change marker) and is no code written from column 1
+  // (`main: proc;`).
+  const carriageControl =
+    language === "pli" && (blankSequence || code.every((line) => isProcess(line) || " 01-+".includes(line[0]) || line[1] === " " || line.length === 1));
   if (!carriageControl && !blankSequence) {
     return text;
   }

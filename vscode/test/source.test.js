@@ -52,6 +52,16 @@ test("comments, strings and sequence numbers are not code", () => {
   assert.equal(blankMargins(text, "pli").slice(72, 80), "        ");
 });
 
+test("a character in column 1 is no code: a change marker, or anything in a numbered member", () => {
+  const marked = [" M: PROC;", "X  DCL ME CHAR(1);", "D  PUT SKIP LIST(ME);", " END M;"].join("\n");
+  assert.deepEqual(fields(marked), ["ME:1 CHAR(1)"]);
+  const numbered = [" N: PROC;", "XDCL ME CHAR(1);", " END N;"].map((l, i) => `${l.padEnd(72)}0000${i + 1}000`).join("\n");
+  assert.deepEqual(fields(numbered), ["ME:1 CHAR(1)"]);
+  // Written from column 1, as off the mainframe: column 1 is code.
+  const free = ["main: proc;", "  dcl me char(1);", "end main;"].join("\n");
+  assert.equal(blankMargins(free, "pli"), free);
+});
+
 test("uses carry their qualifiers and know SQL and host variables", () => {
   const code = pliCode(" X = CUST.ADDR.CITY; EXEC SQL SELECT NAME INTO :N FROM T; P->A.B = 1;");
   const uses = pliUses(code).map((u) => `${[...u.qualifiers, u.name].join(".")}${u.sql ? " sql" : ""}${u.host ? " host" : ""}`);

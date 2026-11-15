@@ -29,12 +29,19 @@
 - **Fixed-format detection is a heuristic** (`blankMargins` in
   `vscode/src/source.js`). A file counts as fixed-format when:
   - no line is longer than 80 characters;
-  - every code line starts with a blank, `0`, `1`, `-`, `+` or `*PROCESS` /
-    `%PROCESS`.
+  - and column 1 is blanked when the file is numbered (below), or every
+    code line has a blank, `0`, `1`, `-` or `+` there, a character with a
+    blank after it (a change marker: `X  DCL`), or is `*PROCESS` /
+    `%PROCESS`. One `main: proc;` written from column 1 keeps column 1 as
+    code in the whole file; one marker followed straight by code (`XDCL`) in
+    an unnumbered file does too, and its declarations are then not found.
 
   Columns 73-80 are blanked only when at least 90% of code lines have
-  something there. A `MARGINS(...)` compiler option is not read. On the Zowe
-  samples this brings parse errors from 3336 down to 134.
+  something there. A member numbered only in part (old lines numbered, new
+  ones not) keeps its numbers, and each is a syntax error at column 73
+  (`PLG023W ... 1:73 at "00000100"`). A `MARGINS(...)` compiler option is
+  not read. On the Zowe samples this brings parse errors from 3336 down
+  to 134.
 - **Tables and screens resolve by name.** Two DDL files defining `CUSTOMER`
   both get the link; a schema only narrows it when one of them matches. A
   PL/I string literal that happens to equal a format or message name links
