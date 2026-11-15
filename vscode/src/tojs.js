@@ -257,6 +257,42 @@ function hostVariables(text) {
   return found;
 }
 
+// The procedure a statement `s` calls, if it is a CALL the graph resolved.
+const CALLEE = `(SELECT l.target_symbol FROM refs r JOIN links l ON l.ref = r.id
+  WHERE r.file = s.file AND r.caller IS s.caller AND r.kind = 'call' AND r.line BETWEEN s.line AND s.end_line LIMIT 1)`;
+
+/** @typedef {{ mode: string, position: number | null, callee: number | null }} Change */
+
+/** @type {WeakMap<import("node:sqlite").DatabaseSync, { version: unknown, byName: Map<string, Change[]> }>} */
+const unresolved = new WeakMap();
+
+/**
+ * The writes and passes to CALLs of names no variable was found for, by the
+ * name's last part. Read once per graph version and shared by every program:
+ * finding them by name per variable scans them all (`LIKE '%.X'` uses no
+ * index), which took hours on a big repo with many unresolved names.
+ * @param {import("node:sqlite").DatabaseSync} db
+ */
+function unresolvedChanges(db) {
+  const version = /** @type {{ value: unknown } | undefined} */ (db.prepare(`SELECT value FROM meta WHERE name = 'graph_version'`).get())?.value;
+  const known = unresolved.get(db);
+  if (known && known.version === version) return known.byName;
+  /** @type {Map<string, Change[]>} */
+  const byName = new Map();
+  const rows = db.prepare(
+    `/* full scan */ SELECT a.name, a.mode, a.position, ${CALLEE} AS callee
+     FROM accesses a JOIN statements s ON s.id = a.statement WHERE a.variable IS NULL AND a.mode != 'read'`,
+  );
+  for (const row of /** @type {Iterable<Change & { name: string }>} */ (rows.iterate())) {
+    const last = row.name.slice(row.name.lastIndexOf(".") + 1).toUpperCase();
+    const changes = byName.get(last) ?? [];
+    changes.push({ mode: row.mode, position: row.position, callee: row.callee });
+    byName.set(last, changes);
+  }
+  unresolved.set(db, { version, byName });
+  return byName;
+}
+
 /**
  * Translates one PL/I program to an ES module.
  * @param {import("node:sqlite").DatabaseSync} db the graph
@@ -426,11 +462,9 @@ function programToJs(db, root, indexer, path) {
      ORDER BY v.parameter`,
   );
   const changesOf = db.prepare(
-    `SELECT a.mode, a.position,
-       (SELECT l.target_symbol FROM refs r JOIN links l ON l.ref = r.id
-        WHERE r.file = s.file AND r.caller IS s.caller AND r.kind = 'call' AND r.line BETWEEN s.line AND s.end_line LIMIT 1) AS callee
+    `SELECT a.mode, a.position, ${CALLEE} AS callee
      FROM accesses a JOIN statements s ON s.id = a.statement
-     WHERE a.mode != 'read' AND (a.variable = ? OR a.through = ? OR (a.variable IS NULL AND (a.name = ? OR a.name LIKE '%.' || ?)))`,
+     WHERE a.mode != 'read' AND (a.variable = ? OR a.through = ?)`,
   );
   /** @type {Map<number, { name: string, parameter: number }[]>} */
   const changedParameters = new Map();
@@ -439,7 +473,7 @@ function programToJs(db, root, indexer, path) {
    * @param {string | null} name also the accesses not resolved to a variable, by this name
    */
   const changed = (id, name) =>
-    /** @type {{ mode: string, position: number | null, callee: number | null }[]} */ (changesOf.all(id, id, name, name)).some(
+    [.../** @type {Change[]} */ (changesOf.all(id, id)), ...(name === null ? [] : (unresolvedChanges(db).get(name.toUpperCase()) ?? []))].some(
       (c) => c.mode === "write" || (c.callee !== null && changedBy(c.callee).some((p) => p.parameter === c.position)),
     );
   /**
