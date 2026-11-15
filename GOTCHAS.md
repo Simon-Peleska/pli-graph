@@ -187,6 +187,23 @@
   read-only, so a `query_graph` cannot write even if Copilot tries.
   VSCodium has the API but no Copilot; test the server over stdio
   (`test/mcp.test.js`) or with another MCP chat extension.
+- **Descriptions live outside the graph, and two writers can race.**
+  `pli-graph.descriptions.jsonl` is in the workspace so it survives every
+  rebuild of the graph and goes through git. The page's worker and each MCP
+  server read it, change it and write it back whole (through a temporary
+  file and a rename) with no lock, so two saves in the same moment can
+  lose one. Rare with people typing; an agent describing in a loop while
+  someone saves in the page could hit it. A line that is no description
+  (a merge conflict) stops every save (`PLG091E`) rather than be dropped.
+- **Subject keys resolve by name, then filter.** `Graph.subject()` looks a
+  key's name up on an indexed column and compares the whole key in the same
+  SQL (never after a `LIMIT`: `RC` is declared in thousands of files), so a
+  step is found only through its job's name (or the JCL procedure's
+  member), and a field through its last name part. A key whose code moved
+  keeps its descriptions; the page says the graph has nothing with it. The
+  search's `sql_columns_column_name` index is built the first time an
+  existing graph opens: 31 ms for the sample's 92k rows, so about 0.4 s
+  at 5M lines.
 
 ## The cgr patch set (`patches/`, no longer used by the extension)
 

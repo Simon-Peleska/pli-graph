@@ -212,6 +212,12 @@
         "icon": "$(organization)"
       },
       {
+        "command": "pliGraph.describe",
+        "title": "Describe…",
+        "category": "PL/I Graph",
+        "icon": "$(comment)"
+      },
+      {
         "command": "pliGraph.screenInput",
         "title": "Show Input Rules of the Screen",
         "category": "PL/I Graph",

@@ -1,5 +1,6 @@
 // An MCP server over a workspace folder's graph, for Copilot and any other
-// MCP client: stdio, one JSON-RPC message per line, read-only. The extension
+// MCP client: stdio, one JSON-RPC message per line, read-only but for the
+// descriptions file describe writes. The extension
 // registers it with VS Code; elsewhere start it as
 //
 //   node out/mcp.cjs <graph .sqlite> <workspace folder>
@@ -8,6 +9,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
+import { Descriptions, LABELS, subjectKey } from "./descriptions.js";
 import { Graph } from "./graph.js";
 
 const [graphFile, root] = process.argv.slice(2);
@@ -186,6 +188,33 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { text: { type: "string", description: "a word, phrase or message code: Kredit, GESPERRT, KDE001" } }, required: ["text"] },
   },
   {
+    name: "subjects",
+    description:
+      "The keys of the graph's subjects whose name starts with a text: programs, procedures, fields, jobs, steps, datasets, Db2 tables and columns, PSBs, DBDs, segments, transactions, screens and screen fields, files and members, with where each is. A key such as procedure:SRC/KDP00001#PRUEFE or column:KUNDE.KDNR is what descriptions and describe take.",
+    inputSchema: { type: "object", properties: { name: { type: "string", description: "the start of a name, without case: KDP, KUNDE, PRUEFE" } }, required: ["name"] },
+  },
+  {
+    name: "descriptions",
+    description:
+      "What experts, programmers, AI agents and documents said about a subject, each description with its label (where it came from), author and date. Read them before explaining a subject; they hold knowledge the code does not. Empty for all descriptions.",
+    inputSchema: { type: "object", properties: { subject: { type: "string", description: "a subject key from subjects; empty for all" } } },
+  },
+  {
+    name: "describe",
+    description:
+      "Writes down what a subject means or does, for the people and agents after you: a description labelled ai agent unless it came from elsewhere, kept in the workspace's pli-graph.descriptions.jsonl. Describe only what you found in the code or were told, and say so. With an id it replaces that description, if it is labelled ai agent.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subject: { type: "string", description: "a subject key from subjects, like procedure:SRC/KDP00001#PRUEFE" },
+        text: { type: "string" },
+        label: { type: "string", enum: LABELS, description: "where the description came from; ai agent when left out" },
+        id: { type: "string", description: "the id of a description to replace" },
+      },
+      required: ["subject", "text"],
+    },
+  },
+  {
     name: "get_source",
     description: "The source of a definition, with line numbers.",
     inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
@@ -199,6 +228,9 @@ const TOOLS = [
 
 /** @type {Graph | undefined} */
 let graph;
+const descriptions = new Descriptions(root);
+// The client's name from initialize signs what describe writes.
+let client = "ai agent";
 
 /** The worker may not have written the graph yet, so it is opened on first use. */
 function open() {
@@ -606,6 +638,34 @@ function call(name, args) {
       })
       .join("\n");
   }
+  if (name === "subjects") {
+    const found = open().subjects(args.name);
+    if (found.length === 0) return `No subject's name starts with ${args.name}.`;
+    return found.map((s) => `${s.key}: ${s.places.map((p) => `${p.path}:${p.line}`).join(", ")}`).join("\n");
+  }
+  if (name === "descriptions") {
+    const { descriptions: all, problems } = descriptions.read();
+    const wanted = (args.subject ?? "").toUpperCase();
+    const found = wanted ? all.filter((d) => d.subject.toUpperCase() === wanted) : all;
+    // A model's context holds less than the file.
+    const shown = found.slice(0, 200);
+    return [
+      ...(found.length ? [] : [`No description${wanted ? ` of ${args.subject}` : ""} yet.`]),
+      ...shown.map((d) => `${wanted ? "" : `${d.subject} `}[${d.label}] ${d.author}, ${d.at.slice(0, 10)}, id ${d.id}: ${d.text}`),
+      ...(shown.length < found.length ? [`Only the first 200 of ${found.length} descriptions are shown.`] : []),
+      ...problems,
+    ].join("\n");
+  }
+  if (name === "describe") {
+    const label = args.label || "ai agent";
+    // An agent fixing its own words must not relabel what an expert said.
+    const old = args.id && descriptions.read().descriptions.find((d) => d.id === args.id);
+    if (old && old.label !== "ai agent") throw new Error(`[PLG099E] Description ${args.id} is labelled ${old.label}; an agent may only replace ai agent descriptions. Add a new one instead.`);
+    const written = args.id
+      ? descriptions.update(args.id, { label, text: args.text, author: client })
+      : descriptions.add({ subject: subjectKey(open(), args.subject), label, text: args.text, author: client });
+    return `Saved as ${written.id} for ${written.subject}.`;
+  }
   if (name === "get_source") {
     const found = defined(args.name);
     if (found.length === 0) return `Nothing named ${args.name} is defined.`;
@@ -628,6 +688,7 @@ function call(name, args) {
 /** @param {any} message @returns {object | undefined} the result, or nothing for a notification */
 function answer(message) {
   if (message.method === "initialize") {
+    client = message.params?.clientInfo?.name || client;
     return {
       protocolVersion: message.params?.protocolVersion ?? "2025-06-18",
       capabilities: { tools: {} },

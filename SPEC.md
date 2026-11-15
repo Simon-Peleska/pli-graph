@@ -178,6 +178,13 @@ Every item has:
   every item, in a way a reader can tell `exact` from `generated` at a
   glance.
 
+Exists today: **descriptions**, `text` items people and agents write about
+any subject, kept in `pli-graph.descriptions.jsonl` in the workspace
+(vscode/README.md, *Describe…*). Each carries a label for its source
+(`expert`, `programmer`, `ai agent`, `docs`), its author and date. They
+have no trust or hash yet: `ai agent` is the nearest to `generated`, the
+others to `recorded`.
+
 ---
 
 ## 4. Layers
@@ -584,7 +591,7 @@ The harness is tuned like any other program: by a test suite.
 
 Exists today: `find_definition`, `find_references`, `dependencies`,
 `dependents`, `dataset`, `program_files`, `table_columns`, `psb`, `screen`,
-`screen_input`, `dli`, `transaction`, `data_use`, `dead_code`, `messages`, `decision_table`, `batch_chain`, `hotspots`, `data_owners`, `field`, `lineage`, `text`, `get_source`, `query_graph`.
+`screen_input`, `dli`, `transaction`, `data_use`, `dead_code`, `messages`, `decision_table`, `batch_chain`, `hotspots`, `data_owners`, `field`, `lineage`, `text`, `subjects`, `descriptions`, `describe`, `get_source`, `query_graph`.
 
 - **FR-MCP-1** `explain(subject)`: the summary, rules, glossary terms and
   metadata of a subject, with trust and sources.

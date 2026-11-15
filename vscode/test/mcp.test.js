@@ -33,7 +33,7 @@ test("the server introduces itself and lists its tools", () => {
   assert.equal(hello.result.serverInfo.name, "pli-graph");
   assert.deepEqual(
     list.result.tools.map((/** @type {any} */ t) => t.name),
-    ["find_definition", "find_references", "dependencies", "dependents", "dataset", "batch_chain", "hotspots", "data_owners", "program_files", "table_columns", "psb", "screen", "screen_input", "column_path", "dli", "transaction", "data_use", "dead_code", "messages", "decision_table", "field", "lineage", "text", "get_source", "query_graph"],
+    ["find_definition", "find_references", "dependencies", "dependents", "dataset", "batch_chain", "hotspots", "data_owners", "program_files", "table_columns", "psb", "screen", "screen_input", "column_path", "dli", "transaction", "data_use", "dead_code", "messages", "decision_table", "field", "lineage", "text", "subjects", "descriptions", "describe", "get_source", "query_graph"],
   );
 });
 

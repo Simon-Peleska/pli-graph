@@ -224,6 +224,33 @@ extension keeps of each workspace folder:
   - Datasets nobody writes are left out.
 
   A box filters by name, program or status; a click opens the line.
+- **PL/I Graph: Describe…** keeps what people and agents know about the
+  graph's subjects (SPEC §3.1): programs, procedures, fields, jobs, steps,
+  datasets, Db2 tables and columns, PSBs, DBDs, segments, transactions,
+  screens and screen fields, files and members. It searches the subjects by
+  name, the word at the cursor first, and opens the subject's descriptions
+  with a form to add, edit and delete them. Each description has a label
+  saying where it came from (`expert`, `programmer`, `ai agent`, `docs`),
+  its author (the OS user, or the MCP client's name) and a date. *All
+  descriptions* lists every one, filtered by a box. The graph page's
+  details show a subject's descriptions and a *Describe* button.
+
+  They are kept in `pli-graph.descriptions.jsonl` in the workspace folder,
+  one JSON object per line (`id`, `subject`, `label`, `text`, `author`,
+  `at`), sorted by subject, so they go through git with the code and
+  survive every rebuild of the graph. A subject's key is like
+  `procedure:SRC/KDP00001#PRUEFE`, `field:INCLUDE/KDC00001#KUNDE_SEG.KDNR`,
+  `column:PROD.KUNDE.KDNR` or `step:KDJOB01.PRUEF`; keys are matched
+  without case. A description stays when its subject leaves the code: the
+  page says the graph no longer has it. A module on the graph page is its
+  `program:` when it is a main program, else its `file:`. Over MCP an agent
+  may replace only `ai agent` descriptions.
+
+  Every line stands alone and the lines are sorted again on every save, so
+  two branches that both added descriptions merge without conflicts with
+  `pli-graph.descriptions.jsonl merge=union` in the repo's `.gitattributes`.
+  A description changed on both branches is then kept twice, under one id;
+  delete the one that is wrong.
 - **PL/I Graph: Show Input Rules of the Screen** takes the MFS format or
   message at the cursor (or the active file's) and lists, per field the user
   types, the variable of the program's I/O area it lands in, the conditions
@@ -401,7 +428,11 @@ extension keeps of each workspace folder:
   by the most programs and procedures, with their reads, writes, tests and
   transactions), `data_owners` (every segment, table and dataset with the
   programs that insert, read, update and delete it, shared, owned or read
-  only, and the groups of programs writing the same data),
+  only, and the groups of programs writing the same data), `subjects`
+  (the keys of subjects whose name starts with a text), `descriptions` (a
+  subject's descriptions, or all of them) and `describe` (adds or replaces
+  a description, labelled `ai agent` unless told otherwise; the only tool
+  that writes, and only to `pli-graph.descriptions.jsonl`),
   `program_files` (a program's files, records, keys and the datasets they
   are in), `table_columns` (a Db2 table's columns and the SQL statements
   that select, compare, set or insert each, with their host variables),
@@ -864,6 +895,21 @@ so on them only the silent gaps apply.
   third character; the transaction is left out.
 - `PLG089E` Show TODOs: there is no `generated/JS/TODO.md` yet; run
   Generate JavaScript first.
+- `PLG090W` Descriptions: a line of `pli-graph.descriptions.jsonl` is no
+  description, such as a merge conflict's marker; the others are read.
+- `PLG091E` Descriptions: nothing is saved while the file has such lines,
+  since writing it back would drop them; fix them first.
+- `PLG092E` Describe: the label is none of `expert`, `programmer`,
+  `ai agent`, `docs`.
+- `PLG093E` Describe: the text is empty.
+- `PLG094E` Describe: the key names no subject in the graph; find it with a
+  subject search.
+- `PLG095E` Describe: no description has the id (another window deleted it).
+- `PLG096E` Descriptions: reading the file failed.
+- `PLG097E` Describe: writing the file failed.
+- `PLG098E` Describe…: searching the subjects failed.
+- `PLG099E` MCP describe: an agent tried to replace a description not
+  labelled `ai agent`; it adds a new one instead.
 
 The graph page's own codes: `VIZ-101` the id in the URL is not in the graph,
 `VIZ-102` a view could not be drawn, `VIZ-103` the details, `VIZ-104` the
@@ -890,7 +936,10 @@ job writes a dataset, `VIZ-139` the batch chain could not be drawn, `VIZ-140` th
 could not be read, `VIZ-141` no field or column is used, `VIZ-142` the
 hotspots could not be drawn, `VIZ-143` the data owners could not be read,
 `VIZ-144` no segment, table or dataset is used, `VIZ-145` the data owners
-could not be drawn.
+could not be drawn, `VIZ-146` the descriptions could not be read,
+`VIZ-147` a description could not be saved or deleted, `VIZ-148` the
+descriptions could not be drawn, `VIZ-149` the details' descriptions could
+not be read, `VIZ-150` the subject search failed.
 
 Don't install it next to the pli-lsp extension: both define the `pli`
 language, so highlighting would clash and trees would show twice.

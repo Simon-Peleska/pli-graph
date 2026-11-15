@@ -195,6 +195,122 @@ class Edges {
   }
 }
 
+// The subjects of SPEC §3.1 the graph knows. Each query takes a range of
+// names `>= ? AND <= ?` on an indexed column, once per SELECT (`ranges`): a
+// prefix to search or one exact name to resolve a key, and gives each row's
+// key. `name` is that name in a key. A search lists the kinds in this order.
+const lastPart = (/** @type {string} */ rest) => rest.slice(rest.lastIndexOf(".") + 1);
+const afterHash = (/** @type {string} */ rest) => rest.slice(rest.indexOf("#") + 1);
+/** @typedef {{ kinds: string[], name: (rest: string) => string, ranges?: number, sql: string }} SubjectQuery */
+/** @type {SubjectQuery[]} */
+const SUBJECTS = [
+  {
+    kinds: ["program"],
+    name: (rest) => rest,
+    sql: `SELECT 'program:' || f.member AS key, f.member AS name, f.path, 1 AS line FROM files f
+          WHERE f.member >= ? AND f.member <= ? AND f.language = 'pli'
+            AND NOT EXISTS (SELECT 1 FROM links l JOIN refs r ON r.id = l.ref WHERE l.target_file = f.id AND r.kind = 'include')`,
+  },
+  {
+    kinds: ["procedure"],
+    name: afterHash,
+    sql: `SELECT 'procedure:' || f.path || '#' || s.name AS key, s.name, f.path, s.line FROM symbols s JOIN files f ON f.id = s.file
+          WHERE s.name >= ? AND s.name <= ? AND f.language = 'pli' AND s.kind != 'package'`,
+  },
+  {
+    kinds: ["job", "psb", "dbd", "transaction"],
+    name: (rest) => rest,
+    sql: `SELECT s.kind || ':' || s.name AS key, s.name, f.path, s.line FROM symbols s JOIN files f ON f.id = s.file
+          WHERE s.name >= ? AND s.name <= ? AND s.kind IN ('job', 'psb', 'dbd', 'transaction')`,
+  },
+  {
+    kinds: ["screen"],
+    name: (rest) => rest,
+    sql: `SELECT 'screen:' || s.name AS key, s.name, f.path, s.line FROM symbols s JOIN files f ON f.id = s.file
+          WHERE s.name >= ? AND s.name <= ? AND s.kind IN ('format', 'message')`,
+  },
+  {
+    kinds: ["table"],
+    name: lastPart,
+    ranges: 2,
+    sql: `SELECT 'table:' || COALESCE(s.qualifier || '.', '') || s.name AS key, s.name, f.path, s.line FROM symbols s JOIN files f ON f.id = s.file
+          WHERE s.name >= ? AND s.name <= ? AND s.kind IN ('table', 'view', 'alias')
+          UNION ALL
+          SELECT 'table:' || COALESCE(c.schema || '.', '') || c.table_name, c.table_name, f.path, min(c.line) FROM sql_columns c JOIN files f ON f.id = c.file
+          WHERE c.table_name >= ? AND c.table_name <= ?
+            AND NOT EXISTS (SELECT 1 FROM symbols t WHERE t.name = c.table_name AND t.kind IN ('table', 'view', 'alias'))
+          GROUP BY c.schema, c.table_name`,
+  },
+  {
+    kinds: ["column"],
+    name: lastPart,
+    ranges: 2,
+    sql: `SELECT 'column:' || COALESCE(t.qualifier || '.', '') || c.table_name || '.' || c.name AS key, c.name, f.path, c.line
+          FROM columns c JOIN symbols t ON t.id = c.table_symbol JOIN files f ON f.id = c.file
+          WHERE c.name >= ? AND c.name <= ?
+          UNION ALL
+          SELECT 'column:' || COALESCE(c.schema || '.', '') || c.table_name || '.' || c.column_name, c.column_name, f.path, min(c.line)
+          FROM sql_columns c JOIN files f ON f.id = c.file
+          WHERE c.column_name >= ? AND c.column_name <= ? AND c.table_name IS NOT NULL AND c.column_name != '*'
+            AND NOT EXISTS (SELECT 1 FROM columns d WHERE d.table_name = c.table_name AND d.name = c.column_name)
+          GROUP BY c.schema, c.table_name, c.column_name`,
+  },
+  {
+    kinds: ["segment"],
+    name: lastPart,
+    sql: `SELECT 'segment:' || d.name || '.' || g.name AS key, g.name, f.path, g.line FROM segments g JOIN symbols d ON d.id = g.dbd JOIN files f ON f.id = g.file
+          WHERE g.name >= ? AND g.name <= ?`,
+  },
+  {
+    kinds: ["screen-field"],
+    name: lastPart,
+    sql: `SELECT 'screen-field:' || s.name || '.' || m.name AS key, m.name, f.path, m.line FROM mfs_fields m JOIN symbols s ON s.id = m.screen JOIN files f ON f.id = m.file
+          WHERE m.name >= ? AND m.name <= ?`,
+  },
+  {
+    kinds: ["field"],
+    name: (rest) => lastPart(afterHash(rest)),
+    sql: `SELECT 'field:' || f.path || '#' || v.qualified AS key, v.qualified AS name, f.path, v.line FROM variables v JOIN files f ON f.id = v.file
+          WHERE v.name >= ? AND v.name <= ? AND v.name != '*'`,
+  },
+  {
+    // Steps have no index on their name: they are found by their job, or the JCL procedure's member.
+    kinds: ["step"],
+    name: (rest) => rest.slice(0, rest.lastIndexOf(".")),
+    ranges: 2,
+    sql: `SELECT 'step:' || j.name || '.' || st.name AS key, st.name, f.path, st.line FROM symbols j JOIN steps st ON st.job = j.id JOIN files f ON f.id = st.file
+          WHERE j.name >= ? AND j.name <= ? AND j.kind = 'job' AND st.name IS NOT NULL
+          UNION ALL
+          SELECT 'step:' || f.member || '.' || st.name, st.name, f.path, st.line FROM files f JOIN steps st ON st.file = f.id
+          WHERE f.member >= ? AND f.member <= ? AND st.job IS NULL AND st.name IS NOT NULL`,
+  },
+  {
+    kinds: ["dataset"],
+    name: (rest) => rest,
+    sql: `SELECT 'dataset:' || d.dsn AS key, d.dsn AS name, f.path, d.line FROM dds d JOIN files f ON f.id = d.file
+          WHERE d.dsn >= ? AND d.dsn <= ? AND d.dsn NOT LIKE '&&%'`,
+  },
+  {
+    kinds: ["file"],
+    name: (rest) => (rest.split("/").pop() ?? "").replace(/\.[^.]*$/, ""),
+    sql: `SELECT 'file:' || path AS key, member AS name, path, 1 AS line FROM files WHERE member >= ? AND member <= ?`,
+  },
+  {
+    kinds: ["member"],
+    name: (rest) => rest,
+    sql: `SELECT 'member:' || member AS key, member AS name, path, 1 AS line FROM files WHERE member >= ? AND member <= ?`,
+  },
+];
+
+/**
+ * A subject (SPEC §3.1) and the places in the graph its key resolves to.
+ * @typedef {object} Subject
+ * @property {string} key
+ * @property {string} kind
+ * @property {string} name
+ * @property {{ path: string, line: number }[]} places
+ */
+
 /**
  * @typedef {object} DeadCode
  * @property {{ path: string, line: number, procedure: string | null, kind: string, condition: string, always: boolean, why: string, branch: string, from: number, to: number }[]} conditions
@@ -3800,6 +3916,90 @@ export class Graph {
       this.all(`SELECT s.id FROM symbols s JOIN files f ON f.id = s.file WHERE f.path = ? AND s.name = ? AND s.line = ?`, parts[1], parts[2], Number(parts[3]))
     );
     return rows[0]?.id;
+  }
+
+  /**
+   * Up to `limit` subjects whose name starts with `query`, exact names first.
+   * A member is listed only when several files have it.
+   * @param {string} query
+   * @param {number} [limit]
+   * @returns {Subject[]}
+   */
+  subjects(query, limit = 50) {
+    const name = query.trim().toUpperCase();
+    if (!name) return [];
+    /** @type {Map<string, Subject & { order: number }>} */
+    const found = new Map();
+    for (const [order, def] of SUBJECTS.entries()) {
+      for (const row of this.subjectRows(def, name, `${name}\u{10FFFF}`, "LIMIT ?", limit * 4)) {
+        const subject = found.get(row.key) ?? { key: row.key, kind: row.key.slice(0, row.key.indexOf(":")), name: row.name, places: [], order };
+        subject.places.push({ path: row.path, line: row.line });
+        found.set(row.key, subject);
+      }
+    }
+    const rank = (/** @type {Subject & { order: number }} */ s) => (s.name === name || lastPart(s.name) === name ? 0 : 100) + s.order;
+    return [...found.values()]
+      .filter((s) => s.kind !== "member" || s.places.length > 1)
+      .sort((a, b) => rank(a) - rank(b) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+      .slice(0, limit)
+      .map(({ order, ...subject }) => subject);
+  }
+
+  /**
+   * The subject a key names, with the places it resolves to: none when the
+   * graph does not know it (FR-SUB-3), several for copies (FR-SUB-2).
+   * Undefined for a kind the graph has no facts of.
+   * @param {string} key
+   * @returns {Subject | undefined}
+   */
+  subject(key) {
+    const colon = key.indexOf(":");
+    const kind = key.slice(0, colon).toLowerCase();
+    const rest = key.slice(colon + 1).trim();
+    const def = SUBJECTS.find((d) => d.kinds.includes(kind));
+    if (colon < 0 || !def || !rest) return undefined;
+    const wanted = `${kind}:${rest}`.toUpperCase();
+    const name = def.name(rest).toUpperCase();
+    // Narrowed in SQL: a name like RC is declared in thousands of files.
+    const rows = this.subjectRows(def, name, name, "WHERE upper(key) = ?", wanted);
+    return { key: rows[0]?.key ?? `${kind}:${rest}`, kind, name: rows[0]?.name ?? lastPart(def.name(rest)), places: rows.map((row) => ({ path: row.path, line: row.line })) };
+  }
+
+  /**
+   * The subject key of a graph page node: a module's program, or its file
+   * when it is no program, else the subject defined at the node's place.
+   * @param {string} id
+   * @returns {string | undefined}
+   */
+  subjectOfPage(id) {
+    const module = /** @type {{ member: string } | undefined} */ (this.all(`SELECT member FROM files WHERE path = ?`, id)[0]);
+    if (module) {
+      const programs = /** @type {SubjectQuery} */ (SUBJECTS.find((d) => d.kinds[0] === "program"));
+      const program = this.subjectRows(programs, module.member, module.member, "WHERE path = ?", id)[0];
+      return program?.key ?? `file:${id}`;
+    }
+    const parts = /^(.*):([^:]*):(\d+)$/.exec(id);
+    if (!parts) return undefined;
+    const [, path, qualified, line] = parts;
+    const name = lastPart(qualified);
+    // A program or file is at line 1 too, where its main procedure may be.
+    for (const def of SUBJECTS) {
+      if (["program", "file", "member"].includes(def.kinds[0])) continue;
+      const row = this.subjectRows(def, name, name, "WHERE path = ? AND line = ? LIMIT 1", path, Number(line))[0];
+      if (row) return row.key;
+    }
+    return undefined;
+  }
+
+  /**
+   * A SUBJECTS query's rows for names from `from` to `to`, narrowed by `filter`.
+   * @param {SubjectQuery} def @param {string} from @param {string} to @param {string} filter
+   * @param {...(string | number)} params the filter's
+   * @returns {{ key: string, name: string, path: string, line: number }[]}
+   */
+  subjectRows(def, from, to, filter, ...params) {
+    const ranges = Array.from({ length: def.ranges ?? 1 }, () => [from, to]).flat();
+    return /** @type {any[]} */ (this.all(`SELECT * FROM (${def.sql}) ${filter}`, ...ranges, ...params));
   }
 
   /**

@@ -195,6 +195,7 @@ export function activate(context) {
     vscode.commands.registerCommand("pliGraph.batchChain", () => showBatchChain(context)),
     vscode.commands.registerCommand("pliGraph.hotspots", () => showHotspots(context)),
     vscode.commands.registerCommand("pliGraph.dataOwners", () => showDataOwners(context)),
+    vscode.commands.registerCommand("pliGraph.describe", (/** @type {string | undefined} */ key) => showDescribe(context, key)),
     vscode.commands.registerCommand("pliGraph.screenInput", () => showScreenInput(context)),
     vscode.commands.registerCommand("pliGraph.columnPath", () => showColumnPath(context)),
     vscode.commands.registerCommand("pliGraph.coverage", () => showCoverage(context)),
@@ -1014,8 +1015,9 @@ async function open(folder, target) {
  * question for the graph, a list to save as a file, or going back past its
  * first view.
  * @typedef {object} PageMessage
- * @property {"route" | "open" | "ask" | "save" | "flow" | "back" | "cursor"} type
+ * @property {"route" | "open" | "ask" | "save" | "flow" | "back" | "cursor" | "describe"} type
  * @property {string} [procedure] the page id of the procedure whose flow to show
+ * @property {string} [key] the subject whose descriptions to show
  * @property {string} [title] a new title for the page's tab
  * @property {string} [hash]
  * @property {number} [drawMs]
@@ -1116,6 +1118,48 @@ async function showFlowOf(context, name) {
   });
   pick.onDidHide(() => pick.dispose());
   pick.show();
+}
+
+// The descriptions of the subject with the key a caller passes, else of one
+// picked by name, the word at the cursor searched first, or all of them.
+/** @param {vscode.ExtensionContext} context @param {string} [key] */
+function showDescribe(context, key) {
+  const shown = workspaceShown();
+  if (!shown) return;
+  if (key) return openDescribe(context, shown.workspace, key);
+  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$]+/);
+  /** @type {vscode.QuickPick<vscode.QuickPickItem & { key: string }>} */
+  const pick = vscode.window.createQuickPick();
+  pick.placeholder = "Describe the subject named… (a program, procedure, field, table, column, segment, job, dataset, screen…)";
+  pick.matchOnDescription = true;
+  const all = { key: "", label: "$(list-flat) All descriptions", alwaysShow: true };
+  const search = (/** @type {string} */ query) => {
+    try {
+      const found = query.trim() ? shown.graph.subjects(query.trim()) : [];
+      pick.items = [all, ...found.map((s) => ({ key: s.key, label: s.key, description: s.places.map((p) => `${p.path}:${p.line}`).join(", ") }))];
+    } catch (error) {
+      const message = `[PLG098E] Searching the subjects named ${query} failed: ${error}`;
+      log.error(message);
+      pick.items = [all];
+      void vscode.window.showErrorMessage(message);
+    }
+  };
+  pick.onDidChangeValue(search);
+  pick.onDidAccept(() => {
+    const chosen = pick.selectedItems[0];
+    pick.dispose();
+    if (chosen) openDescribe(context, shown.workspace, chosen.key);
+  });
+  pick.onDidHide(() => pick.dispose());
+  pick.value = word ? (shown.editor?.document.getText(word) ?? "") : "";
+  search(pick.value);
+  pick.show();
+}
+
+/** @param {vscode.ExtensionContext} context @param {Workspace} workspace @param {string} key a subject key, or "" for all */
+function openDescribe(context, workspace, key) {
+  log.info(`descriptions of ${key || "all subjects"}`);
+  openPage(context, workspace, "flow", `v=describe&id=${encodeURIComponent(key)}`, `Descriptions: ${key || "all"}`, true);
 }
 
 /** @param {vscode.ExtensionContext} context @param {Workspace} workspace @param {string} procedure a page id */
@@ -1426,6 +1470,8 @@ function openPage(context, workspace, kind, hash, title, go) {
       void showCursor(workspace, message.path, message.line ?? 1);
     } else if (message.type === "flow" && message.procedure) {
       showFlow(context, workspace, message.procedure);
+    } else if (message.type === "describe" && message.key) {
+      openDescribe(context, workspace, message.key);
     } else if (message.type === "back") {
       log.info(`${kind} page: back from its first view, to the editor before it`);
       void vscode.commands.executeCommand("workbench.action.navigateBack");

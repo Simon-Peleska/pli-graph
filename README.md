@@ -13,7 +13,7 @@ to WebAssembly, which are separate projects:
 The extension is plain JavaScript (types in JSDoc, checked by `tsc`), so one
 `pli-graph.vsix` of about 600 KB serves every platform and needs nothing
 else installed. What it does, its settings, the graph's tables and the error
-codes (`PLG004E`-`PLG089E`) are in [`vscode/README.md`](vscode/README.md).
+codes (`PLG004E`-`PLG099E`) are in [`vscode/README.md`](vscode/README.md).
 
 ## What ends up in the graph
 
@@ -102,6 +102,12 @@ and codes are produced under which conditions (`messages`), what follows
 from each value of a code field across the programs (`decision_table`), where a field is set, passed or compared and under which
 conditions (`field`), where its value comes from and goes, one step each
 way (`lineage`), and which comments and literals contain a text (`text`).
+
+Not in the graph but next to it: **descriptions** of any subject by
+experts, programmers, AI agents or docs, each labelled with where it came
+from, in `pli-graph.descriptions.jsonl` in the workspace, so they go through
+git with the code (*Describe…* in the editor, MCP tools `subjects`,
+`descriptions` and `describe`).
 
 ## Extensionless members
 

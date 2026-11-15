@@ -248,6 +248,10 @@ exports.run = async () => {
   await vscode.commands.executeCommand("pliGraph.dataOwners");
   await webviewTab("Data Owners: all");
   console.log("Show Data Owners opens");
+  // The page names the tab after the subject once the worker answered.
+  await vscode.commands.executeCommand("pliGraph.describe", "procedure:ABHELP01#HELPER");
+  await webviewTab("Descriptions: HELPER");
+  console.log("Describe opens");
 
   // Rejects if the packaged worker or the grammars' highlights queries are missing.
   await vscode.commands.executeCommand("pliGraph.coverage");

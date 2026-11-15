@@ -464,6 +464,7 @@ CREATE INDEX IF NOT EXISTS sql_columns_file ON sql_columns(file);
 CREATE INDEX IF NOT EXISTS sql_columns_column ON sql_columns(table_name, column_name);
 CREATE INDEX IF NOT EXISTS sql_columns_host ON sql_columns(host);
 CREATE INDEX IF NOT EXISTS sql_columns_caller ON sql_columns(caller);
+CREATE INDEX IF NOT EXISTS sql_columns_column_name ON sql_columns(column_name);
 CREATE TABLE IF NOT EXISTS columns (
   id INTEGER PRIMARY KEY,
   file INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -479,6 +480,7 @@ CREATE TABLE IF NOT EXISTS columns (
 CREATE INDEX IF NOT EXISTS columns_file ON columns(file);
 CREATE INDEX IF NOT EXISTS columns_name ON columns(table_name, name);
 CREATE INDEX IF NOT EXISTS columns_table_symbol ON columns(table_symbol);
+CREATE INDEX IF NOT EXISTS columns_column ON columns(name);
 -- IMS gens: the PCBs and SENSEGs of PSBs, the segments and fields of DBDs.
 CREATE TABLE IF NOT EXISTS pcbs (
   id INTEGER PRIMARY KEY,
@@ -660,7 +662,7 @@ export async function createIndexer(grammars) {
 // A first sync loads millions of rows. Keeping these indexes up to date row
 // by row took a quarter of it; built once at the end they cost seconds. No
 // cascading delete needs them, so a file failing midway stays cheap.
-const NAME_INDEXES = ["symbols_name", "refs_name", "variables_name", "accesses_name", "sql_columns_column", "sql_columns_host"];
+const NAME_INDEXES = ["symbols_name", "refs_name", "variables_name", "accesses_name", "sql_columns_column", "sql_columns_host", "sql_columns_column_name"];
 // Only the matching of names writes accesses, and nothing is deleted meanwhile.
 const ACCESS_INDEXES = ["accesses_statement", "accesses_variable", "accesses_through"];
 const INDEXES = SCHEMA.match(/^CREATE INDEX .*;$/gm) ?? [];

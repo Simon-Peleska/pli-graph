@@ -27,7 +27,7 @@ const elements = await build({
 });
 // The few codicons the page's buttons show, as inline SVG.
 const iconNames = ["go-to-file", "type-hierarchy", "references", "git-merge", "save", "eye", "screen-full", "refresh",
-  "arrow-up", "arrow-down", "arrow-both", "table", "list-flat", "symbol-enum"];
+  "arrow-up", "arrow-down", "arrow-both", "table", "list-flat", "symbol-enum", "comment"];
 const icons = Object.fromEntries(iconNames.map((name) =>
   [name, readFileSync(`node_modules/@vscode/codicons/src/icons/${name}.svg`, "utf-8").trim()]));
 const page = readFileSync(new URL("graph.template.html", viz), "utf-8")

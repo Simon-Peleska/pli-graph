@@ -132,6 +132,23 @@ body.flow-page > header, body.flow-page > #sides { display: none; }
 .hot th:first-child { width: 30%; }
 .hot th:last-child { width: auto; }
 .rules td:first-child { width: 30%; }
+.describe { max-width: 900px; }
+.describe .card { border-bottom: 1px solid var(--line); padding: 8px 0; }
+.describe .card .text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
+.describe .card .sub button { margin-left: 8px; }
+.describe .form { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.describe textarea, .describe select, .describe input[type=search] {
+  font: inherit; color: var(--vscode-input-foreground, var(--text)); background: var(--vscode-input-background, #313131);
+  border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 2px; padding: 4px 6px;
+}
+.describe textarea { min-height: 6em; resize: vertical; }
+.describe .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.describe button.text-button { font: inherit; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; }
+.describe .hits div { padding: 2px 0; cursor: pointer; }
+.describe .hits div:hover, .describe h3:hover { color: var(--accent); }
+.describe h3 { margin: 14px 0 2px; font-size: 1em; cursor: pointer; overflow-wrap: anywhere; }
+.details .said { padding: 2px 14px 6px 22px; }
+.details .said p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 2px 0 6px; }
 #flow .lane-odd { fill: var(--panel); }
 #flow .lane-line { stroke: var(--line); }
 #flow .edge { fill: none; stroke: var(--edge); stroke-width: 1.3; shape-rendering: crispEdges; }
@@ -237,7 +254,7 @@ body.flow-page > header, body.flow-page > #sides { display: none; }
 // The page asks VS Code for what each view draws; a big graph does not fit in
 // a page. byId keeps every node seen, for labels and links.
 const host = acquireVsCodeApi();
-const flowPage = ["flow", "data", "model", "crud", "use", "dead", "messages", "chain", "hot", "owners", "input", "column"].includes(new URLSearchParams(location.hash.slice(1)).get("v"));
+const flowPage = ["flow", "data", "model", "crud", "use", "dead", "messages", "chain", "hot", "owners", "input", "column", "describe"].includes(new URLSearchParams(location.hash.slice(1)).get("v"));
 const byId = new Map();
 const remember = nodes => { for (const n of nodes) byId.set(n.id, n); return nodes; };
 let asked = 0;
@@ -257,7 +274,8 @@ window.addEventListener("message", event => {
     if (message.error) asking?.reject(new Error(message.error));
     else asking?.resolve(message.result);
   }
-  if (message?.type === "changed" && flowPage) { dataFlow = null; renderDiagram(); }
+  // Drawn again, the describe view would lose the text being typed.
+  if (message?.type === "changed" && flowPage) { dataFlow = null; if (!isDescribe()) renderDiagram(); }
   else if (message?.type === "changed") document.getElementById("reload-tool").hidden = false;
   if (message?.type === "go") location.hash = message.hash;
   if (message?.type === "cursor") focusAt(message.path, message.line);
@@ -726,6 +744,15 @@ async function showDetails(id) {
     panel.append(...linkList("Defines", details.defines, n.path));
     if (route().id !== id || route().view !== "proc") head.append(iconButton("type-hierarchy", "Graph", () => open(id)));
     head.append(iconButton("git-merge", "Flow", () => host.postMessage({ type: "flow", procedure: id })));
+  }
+  try {
+    const said = await ask("pageDescriptions", id);
+    if (mine !== detailsAsked || !said.key) return;
+    head.append(iconButton("comment", "Describe", () => host.postMessage({ type: "describe", key: said.key })));
+    if (said.descriptions.length) panel.querySelector(".head").after(section("Descriptions", said.descriptions.length, el("div", { class: "said" },
+      ...said.descriptions.map(d => [el("div", { class: "sub" }, `${d.label} · ${d.author}`), el("p", null, d.text)]))));
+  } catch (error) {
+    if (mine === detailsAsked) showError("VIZ-149", `could not read the descriptions of ${id}: ${error.message}`, error);
   }
 }
 
@@ -2130,6 +2157,118 @@ async function renderOwners() {
   }
 }
 
+// ---- descriptions -----------------------------------------------------------
+// What experts, programmers, AI agents and docs say about one subject (the id
+// is its key), with a form to add, change and delete; without an id a search
+// for subjects and every description there is.
+let describeKey = "", describeLabel = "expert", subjectsAsked = 0;
+function showDescribe(key) {
+  describeKey = key || "";
+  document.getElementById("flow-title").textContent = "";
+  document.getElementById("flow-depth-label").hidden = true;
+  document.getElementById("data-as").hidden = true;
+  document.getElementById("flow-body").replaceChildren();
+  renderDescribe();
+}
+async function renderDescribe() {
+  const mine = ++flowAsked;
+  const status = document.getElementById("flow-status"), error = document.getElementById("flow-error");
+  const fail = (code, message, cause) => {
+    console.error(`[${code}] ${message}`, cause || "");
+    error.textContent = `[${code}] ${message}`;
+    error.hidden = false;
+    status.textContent = "";
+  };
+  error.hidden = true;
+  status.textContent = "reading…";
+  const started = performance.now();
+  const what = `the descriptions of ${describeKey || "the workspace"}`;
+  let said;
+  try {
+    said = await ask("descriptions", describeKey);
+  } catch (cause) {
+    if (mine === flowAsked) fail("VIZ-146", `could not read ${what}: ${cause.message}`, cause);
+    return;
+  }
+  if (mine !== flowAsked) return;
+  try {
+    const read = performance.now();
+    const describe = key => { location.hash = new URLSearchParams({ v: "describe", id: key }).toString(); };
+    const save = async (question, ...args) => {
+      try {
+        await ask(question, ...args);
+        renderDescribe();
+      } catch (cause) {
+        fail("VIZ-147", `could not save: ${cause.message}`, cause);
+      }
+    };
+    const label = el("select", {}, ...said.labels.map(l => el("option", { value: l }, l)));
+    label.value = describeLabel;
+    const text = el("textarea", { placeholder: "What it is for, what it means, what to watch out for" });
+    let editing = null;
+    const submit = el("vscode-button", {}, "Add");
+    const cancel = el("vscode-button", { secondary: "", hidden: "" }, "Cancel");
+    const edit = d => { editing = d.id; label.value = d.label; text.value = d.text; submit.textContent = "Save"; cancel.hidden = false; text.focus(); };
+    cancel.addEventListener("click", () => { editing = null; text.value = ""; submit.textContent = "Add"; cancel.hidden = true; });
+    submit.addEventListener("click", () => { describeLabel = label.value; save("describe", said.subject?.key ?? describeKey, label.value, text.value, editing); });
+    const card = (d, editable, removable) => {
+      let armed = false;
+      const remove = el("button", { class: "text-button" }, "Delete");
+      remove.addEventListener("click", () => {
+        if (armed) return save("undescribe", d.id);
+        armed = true;
+        remove.textContent = "Delete for good?";
+      });
+      return el("div", { class: "card" },
+        el("div", { class: "sub" }, el("vscode-badge", {}, d.label), ` ${d.author} · ${new Date(d.at).toLocaleString()}`,
+          editable ? el("button", { class: "text-button", onclick: () => edit(d) }, "Edit") : null, removable ? remove : null),
+        el("div", { class: "text" }, d.text));
+    };
+    const problems = said.problems.map(p => el("div", { class: "guard" }, p));
+    const body = el("div", { class: "rules describe" }, ...problems);
+    let title = "all";
+    if (describeKey) {
+      const subject = said.subject;
+      title = subject?.name ?? describeKey;
+      document.getElementById("flow-title").textContent = subject?.key ?? describeKey;
+      const places = subject?.places ?? [];
+      body.append(
+        places.length
+          ? el("div", { class: "sub" }, ...places.slice(0, 20).map(p => el("pre", { onclick: () => host.postMessage({ type: "open", path: p.path, line: p.line }) }, `${p.path}:${p.line}`)))
+          : el("div", { class: "guard" }, subject ? "the graph has nothing with this key; its descriptions are kept" : "no kind of subject the graph knows"),
+        // Without a place there is no form to edit in; a description of something gone can still be deleted.
+        ...said.descriptions.map(d => card(d, places.length > 0, true)),
+        said.descriptions.length ? null : el("div", { class: "guard" }, "no description yet"),
+        places.length ? el("div", { class: "form" }, el("div", { class: "row" }, "From", label), text, el("div", { class: "row" }, submit, cancel)) : null);
+    } else {
+      const find = el("input", { type: "search", placeholder: "find a program, procedure, field, table, column, job, dataset, screen… to describe" });
+      const hits = el("div", { class: "hits" });
+      const list = el("div", {});
+      const draw = async () => {
+        const wanted = find.value.trim().toUpperCase();
+        const bySubject = new Map();
+        for (const d of said.descriptions) if (!wanted || `${d.subject} ${d.label} ${d.author} ${d.text}`.toUpperCase().includes(wanted)) push(bySubject, d.subject, d);
+        list.replaceChildren(...[...bySubject].flatMap(([key, ds]) => [el("h3", { onclick: () => describe(key) }, key), ...ds.map(d => card(d, false, false))]),
+          bySubject.size ? "" : el("div", { class: "guard" }, said.descriptions.length ? "no description matches" : "no description yet"));
+        const asked = ++subjectsAsked;
+        const found = wanted ? await ask("subjects", wanted) : [];
+        if (asked !== subjectsAsked) return;
+        hits.replaceChildren(...found.map(s => el("div", { onclick: () => describe(s.key), title: s.places.map(p => `${p.path}:${p.line}`).slice(0, 10).join("\n") },
+          `${s.key}${s.descriptions ? `  (${s.descriptions})` : ""}`)));
+      };
+      find.addEventListener("input", () => draw().catch(cause => fail("VIZ-150", `could not search the subjects: ${cause.message}`, cause)));
+      body.append(find, hits, list);
+      await draw();
+    }
+    document.getElementById("flow-body").replaceChildren(body);
+    status.textContent = "";
+    host.postMessage({ type: "route", hash: location.hash.slice(1), title: `Descriptions: ${title}`, drawMs: Math.round(performance.now() - read), sinceLoadMs: Math.round(performance.now()) });
+    console.info(`[graph] ${what}: ${said.descriptions.length} descriptions, read in ${Math.round(read - started)} ms, drawn in ${Math.round(performance.now() - read)} ms`);
+  } catch (cause) {
+    fail("VIZ-148", `could not draw ${what}: ${cause.message}`, cause);
+  }
+}
+
 // The diagram tab shows a procedure's flow, a variable's data flow, a DDL
 // file's data model, what transactions or a procedure do to the data, the
 // dead code, the messages and codes, the batch chain, the hotspots, a screen's input rules
@@ -2143,8 +2282,9 @@ const isMessages = () => route().view === "messages";
 const isChain = () => route().view === "chain";
 const isHot = () => route().view === "hot";
 const isOwners = () => route().view === "owners";
-const showDiagram = () => isModel() ? showModel(route().id) : route().view === "data" ? showData(route().id) : isCrud() ? showCrud(route().id) : isDead() ? showDead(route().id) : isMessages() ? showMessages(route().id) : isChain() ? showChain(route().id) : isHot() ? showHot(route().id) : isOwners() ? showOwners(route().id) : isInput() ? showInput(route().id) : isColumn() ? showColumn(route().id) : showFlow(route().id);
-const renderDiagram = () => isModel() ? renderModel() : route().view === "data" ? renderData() : isCrud() ? renderCrud() : isDead() ? renderDead() : isMessages() ? renderMessages() : isChain() ? renderChain() : isHot() ? renderHot() : isOwners() ? renderOwners() : isInput() ? renderInput() : isColumn() ? renderColumn() : renderFlow();
+const isDescribe = () => route().view === "describe";
+const showDiagram = () => isDescribe() ? showDescribe(route().id) : isModel() ? showModel(route().id) : route().view === "data" ? showData(route().id) : isCrud() ? showCrud(route().id) : isDead() ? showDead(route().id) : isMessages() ? showMessages(route().id) : isChain() ? showChain(route().id) : isHot() ? showHot(route().id) : isOwners() ? showOwners(route().id) : isInput() ? showInput(route().id) : isColumn() ? showColumn(route().id) : showFlow(route().id);
+const renderDiagram = () => isDescribe() ? renderDescribe() : isModel() ? renderModel() : route().view === "data" ? renderData() : isCrud() ? renderCrud() : isDead() ? renderDead() : isMessages() ? renderMessages() : isChain() ? renderChain() : isHot() ? renderHot() : isOwners() ? renderOwners() : isInput() ? renderInput() : isColumn() ? renderColumn() : renderFlow();
 document.getElementById("flow-depth").addEventListener("input", renderDiagram);
 
 // ---- render ---------------------------------------------------------------
