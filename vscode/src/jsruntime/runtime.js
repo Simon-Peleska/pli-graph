@@ -261,37 +261,6 @@ function get(area, path) {
   return path.reduce((at, key) => at[key], area);
 }
 
-/**
- * The fields of `text` into `area`.
- * @param {string} text
- * @param {object} area
- * @param {Layout} layout
- */
-export function decode(text, area, layout) {
-  let at = 0;
-  for (const [path, kind, size, length] of layout) {
-    const field = text.slice(at, at + length).padEnd(length);
-    at += length;
-    put(area, path, kind === "CHAR" ? field : kind === "PIC" ? fromPic(field, size) : kind === "BIT" ? field === "1" : Number(field.trim()) || 0);
-  }
-}
-
-/**
- * The fields of `area` as text.
- * @param {object} area
- * @param {Layout} layout
- */
-export function encode(area, layout) {
-  let text = "";
-  for (const [path, kind, size, length] of layout) {
-    const value = get(area, path);
-    const decimals = Number(size.split(",")[1] ?? 0);
-    const number = kind === "NUMBER" ? (decimals ? Number(value).toFixed(decimals) : String(value)) : "";
-    text += kind === "CHAR" ? char(value, length) : kind === "PIC" ? toPic(Number(value), size) : kind === "BIT" ? (value ? "1" : "0") : number.padStart(length).slice(-length);
-  }
-  return text;
-}
-
 /** A pointer to a scalar: ADDR of a CHAR or other non-structure variable. */
 export class Ref {
   /** @param {() => any} get @param {(value: any) => void} set */
@@ -397,29 +366,24 @@ export function overlay(base, layout, offset = 0) {
 
 export const ims = {
   /**
-   * GU on the I/O PCB: the input message into `area`. Status QC when there
-   * is none left.
+   * GU on the I/O PCB: the text of the input message, after LL and ZZ. Null
+   * and status QC when there is none left.
    * @param {Pcb} pcb
-   * @param {object} area
-   * @param {Layout} layout
+   * @returns {Promise<string | null>}
    */
-  async gu(pcb, area, layout) {
-    if (pcb.input === null) {
-      pcb.STATUS = "QC";
-      return;
-    }
-    decode(pcb.input, area, layout);
+  async gu(pcb) {
+    const message = pcb.input;
     pcb.input = null;
-    pcb.STATUS = "  ";
+    pcb.STATUS = message === null ? "QC" : "  ";
+    return message;
   },
   /**
-   * ISRT on the I/O PCB: `area` as the reply.
+   * ISRT on the I/O PCB: `text` as the reply.
    * @param {Pcb} pcb
-   * @param {object} area
-   * @param {Layout} layout
+   * @param {string} text
    */
-  async isrt(pcb, area, layout) {
-    pcb.output.push(encode(area, layout));
+  async isrt(pcb, text) {
+    pcb.output.push(text);
     pcb.STATUS = "  ";
   },
 };
@@ -999,6 +963,8 @@ export class RecordFile {
     this.next = 0;
     /** @type {number | null} the record read last, for REWRITE and DELETE without KEY */
     this.last = null;
+    /** @type {string | null} the key of the record read last, for KEYTO */
+    this.lastKey = null;
     /** @type {(() => Promise<void>) | null} the ON ENDFILE unit */
     this.onEndfile = null;
     /** @type {(() => Promise<void>) | null} the ON KEY unit */
@@ -1053,14 +1019,12 @@ export class RecordFile {
   }
 
   /**
-   * READ INTO: the next record, or the one with `key`, into `area` by
-   * `layout`; a whole CHAR area has no layout. Null after ENDFILE or KEY.
-   * @param {object | null} area
-   * @param {Layout | null} layout
+   * READ: the text of the next record, or of the one with `key`; its key is
+   * then `lastKey`. Null after ENDFILE or KEY.
    * @param {string} [key]
-   * @returns {Promise<{ key: string | null, text: string } | null>}
+   * @returns {Promise<string | null>}
    */
-  async read(area, layout, key) {
+  async read(key) {
     this.open();
     const records = /** @type {[string | null, string][]} */ (this.records);
     const at = key === undefined ? this.next : this.find(key);
@@ -1075,20 +1039,18 @@ export class RecordFile {
     this.next = at + 1;
     this.last = at;
     const [found, text] = records[at];
-    if (area && layout) decode(text, area, layout);
-    return { key: found, text };
+    this.lastKey = found;
+    return text;
   }
 
   /**
-   * WRITE FROM: `area` as a new record, a keyed one with `key`.
-   * @param {unknown} area
-   * @param {Layout | null} layout
+   * WRITE FROM: `text` as a new record, a keyed one with `key`.
+   * @param {string} text
    * @param {string} [key]
    */
-  async write(area, layout, key) {
+  async write(text, key) {
     this.open({ mode: this.mode ?? "OUTPUT" });
     const records = /** @type {[string | null, string][]} */ (this.records);
-    const text = layout ? encode(/** @type {object} */ (area), layout) : String(area);
     if (!this.keyed || key === undefined) {
       records.push([key ?? null, text]);
       return;
@@ -1099,18 +1061,17 @@ export class RecordFile {
   }
 
   /**
-   * REWRITE FROM: `area` in place of the record with `key`, or of the one
+   * REWRITE FROM: `text` in place of the record with `key`, or of the one
    * read last.
-   * @param {unknown} area
-   * @param {Layout | null} layout
+   * @param {string} text
    * @param {string} [key]
    */
-  async rewrite(area, layout, key) {
+  async rewrite(text, key) {
     this.open({ mode: "UPDATE" });
     const at = await this.target(key);
     if (at === null) return;
     const records = /** @type {[string | null, string][]} */ (this.records);
-    records[at] = [records[at][0], layout ? encode(/** @type {object} */ (area), layout) : String(area)];
+    records[at] = [records[at][0], String(text)];
   }
 
   /** DELETE: the record with `key`, or the one read last. @param {string} [key] */
@@ -1636,125 +1597,127 @@ export async function landing(error, labels) {
  * A DD of a JCL step: a dataset, its generation (+1, 0, -1) or member; a
  * SYSOUT class; in-stream data; or DUMMY.
  * @typedef {{ dsn?: string, generation?: number, member?: string, disp?: string, sysout?: string, data?: string, dummy?: boolean }} Dd
- * A COND test `[code, op, step?]` is true when `code op` the return code
- * of that step, or of any step run before.
- * @typedef {[number, string, string?]} CondTest
- * @typedef {{ rc: (step?: string) => number, abend: (step?: string) => boolean, ran: (step: string) => boolean }} JobState
- * @typedef {{ step: string, program: string, run: ((parm?: string) => Promise<unknown>) | null, parm: string | null, dds: Record<string, Dd>,
- *   cond?: { tests: CondTest[], even?: true, only?: true }, when?: (s: JobState) => boolean, afterAbend?: true,
- *   procedure?: string, procedureWhen?: (s: JobState) => boolean }} Step
- * procedure: the job's step that runs the procedure this step is in;
- * procedureWhen: the IF around it, tested once, before its first step.
  */
 
 /**
- * Runs a JCL job's steps in order. Each DD is a file under DATASETS
+ * A JCL job, run one step at a time. Each DD is a file under DATASETS
  * (default "datasets"): DSN.txt, DSN/MEMBER.txt, a GDG generation as
  * DSN/G0001V00.txt (relative numbers count from the newest when the job
  * starts), SYSOUT as SYSOUT/JOB/STEP.DD.txt (SYSPRINT on stdout), in-stream
  * data as INSTREAM/JOB/STEP.DD.txt, DUMMY as the null device.
- *
- * A step is bypassed when a COND test is true, or its IF (`when`) is false.
- * After a step fails, only steps with COND EVEN or ONLY, or under an IF
- * testing ABEND, run; then the job fails. A true test of the job's COND
- * bypasses the rest.
- * @param {string} job
- * @param {Step[]} steps
- * @param {CondTest[]} [jobCond]
- * @returns {Promise<number>} the highest return code of its steps
  */
-export async function runJob(job, steps, jobCond = []) {
-  const root = process.env.DATASETS ?? "datasets";
-  /** @type {Map<string, number>} the newest generation of each GDG when the job started */
-  const newest = new Map();
-  /** @param {string} dsn */
-  const newestOf = (dsn) => {
-    if (!newest.has(dsn)) {
-      const numbers = existsSync(join(root, dsn)) ? readdirSync(join(root, dsn)).map((f) => /^G(\d{4})V00\.txt$/.exec(f)?.[1]).filter((n) => n !== undefined).map(Number) : [];
-      newest.set(dsn, Math.max(0, ...numbers));
-    }
-    return /** @type {number} */ (newest.get(dsn));
-  };
-  /** @param {Step} step @param {string} name @param {Dd} dd */
-  const pathOf = (step, name, dd) => {
-    if (dd.dummy) return devNull;
-    if (dd.sysout !== undefined) return name === "SYSPRINT" ? null : join(root, "SYSOUT", job, `${step.step}.${name}.txt`);
-    if (dd.data !== undefined) {
-      const path = join(root, "INSTREAM", job, `${step.step}.${name}.txt`);
+export class Job {
+  /** @param {string} name */
+  constructor(name) {
+    this.name = name;
+    this.root = process.env.DATASETS ?? "datasets";
+    /** @type {Map<string, number>} the newest generation of each GDG when the job started */
+    this.newest = new Map();
+    /** @type {Map<string, { rc: number, abended: boolean }>} the steps that ran */
+    this.results = new Map();
+    /** @type {Error | null} the first step that ended abnormally */
+    this.failure = null;
+  }
+
+  /** Whether a step ended abnormally: then only steps with COND EVEN or ONLY, or under an IF testing ABEND, run. */
+  get abended() {
+    return this.failure !== null;
+  }
+
+  /** The return codes of `step`, or of every step that ran, leaving out those that ended abnormally, for COND. @param {string} [step] */
+  codes(step) {
+    return [...this.results].filter(([name, r]) => !r.abended && (step === undefined || name === step)).map(([, r]) => r.rc);
+  }
+
+  /** IF's RC: of `step`, or the highest so far. @param {string} [step] */
+  rc(step) {
+    return step === undefined ? Math.max(0, ...[...this.results.values()].map((r) => r.rc)) : (this.results.get(step)?.rc ?? 0);
+  }
+
+  /** IF's ABEND: of `step`, or of any step. @param {string} [step] */
+  abend(step) {
+    return step === undefined ? this.abended : (this.results.get(step)?.abended ?? false);
+  }
+
+  /** IF's RUN: `step` ran and ended normally. @param {string} step */
+  ran(step) {
+    return this.results.has(step) && !this.results.get(step)?.abended;
+  }
+
+  /** @param {string} step @param {string} dd @param {Dd} data @returns {string | null} null for SYSPRINT, which is stdout */
+  pathOf(step, dd, data) {
+    if (data.dummy) return devNull;
+    if (data.sysout !== undefined) return dd === "SYSPRINT" ? null : join(this.root, "SYSOUT", this.name, `${step}.${dd}.txt`);
+    if (data.data !== undefined) {
+      const path = join(this.root, "INSTREAM", this.name, `${step}.${dd}.txt`);
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, dd.data);
+      writeFileSync(path, data.data);
       return path;
     }
-    const dsn = /** @type {string} */ (dd.dsn);
-    if (dsn.startsWith("&&")) return join(root, "TEMP", job, `${dsn.slice(2)}.txt`);
-    if (dd.generation !== undefined) return join(root, dsn, `G${String(newestOf(dsn) + dd.generation).padStart(4, "0")}V00.txt`);
-    if (dd.member !== undefined) return join(root, dsn, `${dd.member}.txt`);
-    return join(root, `${dsn}.txt`);
-  };
+    const dsn = /** @type {string} */ (data.dsn);
+    if (dsn.startsWith("&&")) return join(this.root, "TEMP", this.name, `${dsn.slice(2)}.txt`);
+    if (data.generation !== undefined) return join(this.root, dsn, `G${String(this.newestOf(dsn) + data.generation).padStart(4, "0")}V00.txt`);
+    if (data.member !== undefined) return join(this.root, dsn, `${data.member}.txt`);
+    return join(this.root, `${dsn}.txt`);
+  }
 
-  /** @type {Map<string, { rc: number, abended: boolean }>} the steps that ran */
-  const results = new Map();
-  /** @type {Error | null} */
-  let failure = null;
-  /** @param {CondTest} test */
-  const holds = ([code, op, name]) => {
-    const codes = name === undefined ? [...results.values()].filter((r) => !r.abended).map((r) => r.rc) : results.has(name) && !results.get(name)?.abended ? [results.get(name)?.rc ?? 0] : [];
-    return codes.some((rc) => ({ GT: code > rc, GE: code >= rc, EQ: code === rc, LT: code < rc, LE: code <= rc, NE: code !== rc })[op]);
-  };
-  /** @type {JobState} */
-  const state = {
-    rc: (name) => (name === undefined ? Math.max(0, ...[...results.values()].map((r) => r.rc)) : (results.get(name)?.rc ?? 0)),
-    abend: (name) => (name === undefined ? failure !== null : (results.get(name)?.abended ?? false)),
-    ran: (name) => results.has(name) && !results.get(name)?.abended,
-  };
-
-  /** @type {Map<string, boolean>} whether the IF around each procedure's EXEC was true */
-  const procedures = new Map();
-  let highest = 0;
-  for (const step of steps) {
-    if (step.procedure && step.procedureWhen && !procedures.has(step.procedure)) procedures.set(step.procedure, step.procedureWhen(state));
-    const when = (step.procedure ? procedures.get(step.procedure) ?? true : true) && (step.when?.(state) ?? true);
-    const bypass =
-      jobCond.some(holds) ||
-      (failure ? !(step.cond?.even || step.cond?.only || (step.afterAbend && when)) : step.cond?.only) ||
-      (step.cond?.tests.some(holds) ?? false) ||
-      !when;
-    if (bypass) {
-      console.error(`${job}.${step.step}: bypassed`);
-      continue;
+  /** @param {string} dsn */
+  newestOf(dsn) {
+    if (!this.newest.has(dsn)) {
+      const dir = join(this.root, dsn);
+      const numbers = existsSync(dir) ? readdirSync(dir).map((f) => /^G(\d{4})V00\.txt$/.exec(f)?.[1]).filter((n) => n !== undefined).map(Number) : [];
+      this.newest.set(dsn, Math.max(0, ...numbers));
     }
-    if (!step.run && step.program !== "IEFBR14") throw new Error(`[PLG066E] ${job}.${step.step}: the program ${step.program} is not translated`);
+    return /** @type {number} */ (this.newest.get(dsn));
+  }
+
+  /**
+   * Runs a step: `program` with its DDs as DD_ and DISP_ environment
+   * variables, the name of a program that is not translated (IEFBR14 does
+   * nothing) failing. A step that fails is logged and the job goes on.
+   * Without PARM the program gets "", as on z/OS.
+   * @param {string} step
+   * @param {((parm: string) => Promise<unknown>) | string} program
+   * @param {Record<string, Dd>} dds
+   * @param {string} [parm]
+   */
+  async step(step, program, dds, parm = "") {
+    const programName = typeof program === "string" ? program : program.name;
+    if (typeof program === "string" && program !== "IEFBR14") throw new Error(`[PLG066E] ${this.name}.${step}: the program ${program} is not translated`);
     /** @type {[string, string, Dd][]} */
-    const files = Object.entries(step.dds).map(([name, dd]) => [name, pathOf(step, name, dd) ?? "", dd]);
-    for (const [name, path, dd] of files) {
-      if (path) process.env[`DD_${name}`] = path;
-      if (dd.disp) process.env[`DISP_${name}`] = dd.disp.split(",")[0] || "NEW";
+    const files = Object.entries(dds).map(([dd, data]) => [dd, this.pathOf(step, dd, data) ?? "", data]);
+    for (const [dd, path, data] of files) {
+      if (path) process.env[`DD_${dd}`] = path;
+      if (data.disp) process.env[`DISP_${dd}`] = data.disp.split(",")[0] || "NEW";
     }
-    console.error(`${job}.${step.step}: ${step.program}`);
+    console.error(`${this.name}.${step}: ${programName}`);
     returnCode = 0;
     let abended = false;
     try {
-      if (step.run) await (step.parm === null ? step.run() : step.run(step.parm));
+      if (typeof program !== "string") await program(parm);
     } catch (error) {
       if (!(error instanceof Stop)) {
         abended = true;
-        const failed = new Error(`[PLG067E] ${job}.${step.step} (${step.program}) ended abnormally: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        const failed = new Error(`[PLG067E] ${this.name}.${step} (${programName}) ended abnormally: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
         console.error(failed);
-        failure ??= failed;
+        this.failure ??= failed;
       }
     } finally {
       for (const file of [...openFiles]) file.close();
-      for (const [name] of files) {
-        delete process.env[`DD_${name}`];
-        delete process.env[`DISP_${name}`];
+      for (const [dd] of files) {
+        delete process.env[`DD_${dd}`];
+        delete process.env[`DISP_${dd}`];
       }
     }
-    results.set(step.step, { rc: returnCode, abended });
-    if (abended) continue;
-    for (const [, path, dd] of files) if (dd.disp?.split(",")[1] === "DELETE" && path && existsSync(path)) rmSync(path);
-    console.error(`${job}.${step.step}: return code ${returnCode}`);
-    highest = Math.max(highest, returnCode);
+    this.results.set(step, { rc: returnCode, abended });
+    if (abended) return;
+    for (const [, path, data] of files) if (data.disp?.split(",")[1] === "DELETE" && path && existsSync(path)) rmSync(path);
+    console.error(`${this.name}.${step}: return code ${returnCode}`);
   }
-  if (failure) throw failure;
-  return highest;
+
+  /** The job's end: the highest return code of its steps, or the first failure thrown. */
+  end() {
+    if (this.failure) throw this.failure;
+    return this.rc();
+  }
 }

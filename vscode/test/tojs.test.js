@@ -94,6 +94,51 @@ test("with SQLITE set, KD07 books onto a customer in SQLite, its tables made fro
   assert.equal(/** @type {{ SALDO: number }} */ (store.prepare(`SELECT SALDO FROM "PROD.KUNDE"`).get()).SALDO, 125.75);
 });
 
+test("an SQL statement on several lines stays on several lines, also a cursor's", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZSQL"),
+    ` ZZSQL: PROC(KNR, SALDO, N);
+   DCL KNR CHAR(8);
+   DCL SALDO FIXED DEC(11,2);
+   DCL N FIXED BIN(31);
+   DCL K CHAR(8);
+   EXEC SQL DECLARE C1 CURSOR FOR
+              SELECT KDNR
+                FROM PROD.KUNDE;
+   EXEC SQL SELECT SALDO
+              INTO :SALDO
+              FROM PROD.KUNDE
+             WHERE KDNR = :KNR;
+   EXEC SQL OPEN C1;
+   EXEC SQL FETCH C1 INTO :K;
+   DO WHILE (SQLCODE = 0);
+     N = N + 1;
+     EXEC SQL FETCH C1 INTO :K;
+   END;
+   EXEC SQL CLOSE C1;
+ END ZZSQL;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZSQL"] });
+  assert.deepEqual(summary.programs[0].todos, []);
+  const code = readFileSync(join(out, "programs/ZZSQL.js"), "utf-8");
+  assert.match(code, /sql\(\s*`SELECT SALDO\n {6,}FROM PROD\.KUNDE\n {5,}WHERE KDNR = \?`/);
+  assert.match(code, /openCursor\(\s*`SELECT KDNR\n {6,}FROM PROD\.KUNDE`/);
+  const own = await import(pathToFileURL(join(out, "runtime.js")).href);
+  own.setDatabase({
+    async query(/** @type {string} */ sql, /** @type {any[]} */ params) {
+      return { rows: kunden.prepare(sql).all(...params).map((row) => Object.values(row)), count: 0 };
+    },
+  });
+  const { ZZSQL } = await import(pathToFileURL(join(out, "programs/ZZSQL.js")).href);
+  const { SALDO, N } = await ZZSQL("00004711", 0, 0);
+  assert.ok(SALDO >= 100.5, String(SALDO));
+  assert.equal(N, 1);
+});
+
 test("an unknown transaction gets an error with its code", async () => {
   const { status, body } = await handle("GET", "/XX99");
   assert.equal(status, 404);
@@ -107,7 +152,9 @@ test("KDP00013 translates without a TODO, with its types in JSDoc", () => {
   const code = readFileSync(join(out, program.module), "utf-8");
   assert.match(code, /export async function KDP00013\(IOPCB_PTR\)/);
   assert.match(code, /\/\*\* @type \{number\} FIXED DEC\(11,2\) \*\/\n\s*let BUCHUNG = 0;/);
-  assert.match(code, /await ims\.gu\(IOPCB, EINGABE, EINGABE_LAYOUT\);/);
+  assert.match(code, /EINGABE_fromMessage\(EINGABE, await ims\.gu\(IOPCB\)\);/);
+  assert.match(code, /area\.KDNR = fromPic\(text\.slice\(8, 16\), "\(8\)9"\);/);
+  assert.doesNotMatch(code, /EINGABE_toMessage/);
   assert.match(code, /KD_NR = char\(toPic\(EINGABE\.KDNR, "\(8\)9"\), 8\);/);
 });
 
@@ -160,9 +207,9 @@ test("parameters a procedure changes come back to the caller, and called program
   );
   const caller = readFileSync(join(out, "programs/ZZP00001.js"), "utf-8");
   assert.match(caller, /import \{ ZZP00002 \} from "\.\/ZZP00002\.js";/);
-  assert.match(caller, /\(\{ RC: RC \} = await ZZP00002\(KEY, RC\)\);/);
+  assert.match(caller, /^\s*RC = await ZZP00002\(KEY, RC\);/m);
   const { ZZP00001 } = await import(pathToFileURL(join(out, "programs/ZZP00001.js")).href);
-  assert.deepEqual(await ZZP00001(0), { OUT: 140 });
+  assert.equal(await ZZP00001(0), 140);
 });
 
 test("a function procedure called with empty parentheses runs", async () => {
@@ -183,7 +230,7 @@ test("a function procedure called with empty parentheses runs", async () => {
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZLEER"] });
   assert.deepEqual(summary.programs[0].todos, []);
   const { ZZLEER } = await import(pathToFileURL(join(out, "programs/ZZLEER.js")).href);
-  assert.deepEqual(await ZZLEER(0), { OUT: 110 });
+  assert.equal(await ZZLEER(0), 110);
 });
 
 test("LEAVE ends the innermost DO group, a loop or not, a GOTO to the END's label ends the pass, and the bounds of a field come from its array of structures", async () => {
@@ -219,8 +266,119 @@ test("LEAVE ends the innermost DO group, a loop or not, a GOTO to the END's labe
   const out = mkdtempSync(join(tmpdir(), "pli-js-"));
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZLEAV"] });
   assert.deepEqual(summary.programs[0].todos, []);
+  const code = readFileSync(join(out, "programs/ZZLEAV.js"), "utf-8");
+  assert.match(code, /WEITER: \{\n.*\n\s*break WEITER;/);
+  assert.doesNotMatch(code, /for \(;;\)/);
+  assert.doesNotMatch(code, /group\d|break;\n\s*\}\n\s*\}\n\s*\}/);
+  assert.match(code, /P = I;\n\s*\}/);
   const { ZZLEAV } = await import(pathToFileURL(join(out, "programs/ZZLEAV.js")).href);
-  assert.deepEqual(await ZZLEAV(0), { OUT: 843022 });
+  assert.equal(await ZZLEAV(0), 843022);
+});
+
+test("a GOTO to a RETURN returns, an IF setting a bit to true or false sets it to the condition, a literal that fits is assigned as it is, an unused variable is left out, and a program calling nothing needs no guard against being called again", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZPRUF"),
+    ` ZZPRUF: PROC(BTR, FLAG) RETURNS(FIXED BIN(15));
+   DCL BTR FIXED DEC(7,2);
+   DCL FLAG BIT(1);
+   DCL OK BIT(1);
+   DCL R FIXED BIN(15) INIT(0);
+   DCL S FIXED DEC(7,2);
+   DCL NIE FIXED BIN(15);
+   IF BTR > 0 THEN OK = '1'B; ELSE OK = '0'B;
+   IF FLAG THEN DO;
+     R = 110;
+     GOTO RAUS;
+   END;
+   IF ^OK THEN DO;
+     R = 109;
+     GOTO RAUS;
+   END;
+   S = 12.5;
+   R = S * 2 + 0.004;
+ RAUS:
+   RETURN(R);
+ END ZZPRUF;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZPRUF"] });
+  assert.deepEqual(summary.programs[0].todos, []);
+  const code = readFileSync(join(out, "programs/ZZPRUF.js"), "utf-8");
+  assert.match(code, /OK = \(?BTR > 0\)?;/);
+  assert.match(code, /S = 12\.5;/);
+  assert.match(code, /\{\n\s+return 110;\n\s+\}/);
+  assert.doesNotMatch(code, /RAUS: \{|break|OK = true|NIE|begin\(|try/);
+  const { ZZPRUF } = await import(pathToFileURL(join(out, "programs/ZZPRUF.js")).href);
+  assert.equal(await ZZPRUF(5, false), 25);
+  assert.equal(await ZZPRUF(-1, false), 109);
+  assert.equal(await ZZPRUF(5, true), 110);
+});
+
+test("ELSE IF chains read as else if, and an empty ELSE or OTHERWISE is left out", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZELSE"),
+    ` ZZELSE: PROC(S, OUT);
+   DCL S CHAR(1);
+   DCL OUT FIXED BIN(31);
+   IF S = 'A' THEN OUT = 1;
+   ELSE IF S = 'B' THEN OUT = 2;
+   ELSE IF S = 'C' THEN DO;
+     OUT = 3;
+   END;
+   ELSE OUT = 4;
+   IF S = 'A' THEN OUT = OUT + 10;
+   ELSE;
+   SELECT (S);
+     WHEN ('B') OUT = OUT + 100;
+     OTHERWISE;
+   END;
+ END ZZELSE;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZELSE"] });
+  assert.deepEqual(summary.programs[0].todos, []);
+  const code = readFileSync(join(out, "programs/ZZELSE.js"), "utf-8");
+  assert.match(code, /\} else if \(S === "B"\) \{\n\s*OUT = 2;\n\s*\} else if \(S === "C"\) \{\n\s*OUT = 3;\n\s*\} else \{\n\s*OUT = 4;\n\s*\}/);
+  assert.doesNotMatch(code, /else \{\n\s*\}/);
+  const { ZZELSE } = await import(pathToFileURL(join(out, "programs/ZZELSE.js")).href);
+  assert.deepEqual(
+    await Promise.all(["A", "B", "C", "D"].map((s) => ZZELSE(s, 0))),
+    [11, 102, 3, 4],
+  );
+});
+
+test("a compare with blanks trims the field, and an empty WHEN says it does nothing", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZBLNK"),
+    ` ZZBLNK: PROC(S, OUT);
+   DCL S CHAR(3);
+   DCL OUT FIXED BIN(31);
+   IF S = '' THEN OUT = 1;
+   ELSE OUT = 2;
+   SELECT (S);
+     WHEN ('A') ;
+     OTHERWISE OUT = OUT + 10;
+   END;
+ END ZZBLNK;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZBLNK"] });
+  assert.deepEqual(summary.programs[0].todos, []);
+  const code = readFileSync(join(out, "programs/ZZBLNK.js"), "utf-8");
+  assert.match(code, /if \(S\.trim\(\) === ""\)/);
+  assert.match(code, /if \(S === "A  "\) \{\n\s*\/\/ nothing to do\n/);
+  const { ZZBLNK } = await import(pathToFileURL(join(out, "programs/ZZBLNK.js")).href);
+  assert.equal(await ZZBLNK("   ", 0), 11);
+  assert.equal(await ZZBLNK("A  ", 0), 2);
 });
 
 test("TRANSLATE, DIVIDE and SUM over a cross-section run without being declared", async () => {
@@ -272,7 +430,7 @@ test("a variable or field named like a built-in is the variable", async () => {
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZNAME"] });
   assert.deepEqual(summary.programs[0].todos, []);
   const { ZZNAME } = await import(pathToFileURL(join(out, "programs/ZZNAME.js")).href);
-  assert.deepEqual(await ZZNAME(0), { OUT: 442 });
+  assert.equal(await ZZNAME(0), 442);
 });
 
 test("the procedures of an include are the includer's, seeing its variables", async () => {
@@ -305,8 +463,148 @@ test("the procedures of an include are the includer's, seeing its variables", as
   assert.deepEqual(summary.programs.map((p) => [p.member, p.todos]), [["ZZMAIN", []]]);
   assert.ok(!existsSync(join(out, "programs/ZZPROCS.js")));
   const { ZZMAIN } = await import(pathToFileURL(join(out, "programs/ZZMAIN.js")).href);
-  assert.deepEqual(await ZZMAIN(0), { OUT: 7 });
+  assert.equal(await ZZMAIN(0), 7);
   assert.ok(said.some((s) => s.includes("SRC/ZZMAIN")), said.join("\n"));
+});
+
+test("a procedure that only reads an array element is a plain function", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZMONA"),
+    ` ZZMONA: PROC(M) RETURNS(FIXED BIN(15));
+   DCL M FIXED BIN(31);
+   DCL TG#MON(12) FIXED BIN(15) STATIC
+       INIT(31,28,31,30,31,30,31,31,30,31,30,31);
+   RETURN(TAGE(M));
+ TAGE: PROC(N) RETURNS(FIXED BIN(15));
+   DCL N FIXED BIN(31);
+   RETURN(TG#MON(N));
+ END TAGE;
+ END ZZMONA;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZMONA"] });
+  assert.deepEqual(summary.programs[0].todos, []);
+  const code = readFileSync(join(out, "programs/ZZMONA.js"), "utf-8");
+  assert.match(code, /^export function ZZMONA\(/m);
+  assert.match(code, /^ *function TAGE\(/m);
+  const { ZZMONA } = await import(pathToFileURL(join(out, "programs/ZZMONA.js")).href);
+  assert.equal(ZZMONA(2), 28);
+});
+
+test("an include's constant passed to a procedure stays a constant unless the procedure changes that parameter", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZKONS"),
+    `   DCL KO_GEB CHAR(2) STATIC INIT('05');
+   DCL KO_ZAEHL FIXED BIN(31) STATIC INIT(1);
+   DCL KO_WEITER FIXED BIN(31) STATIC INIT(3);
+`,
+  );
+  writeFileSync(
+    join(root, "SRC/ZZKALL"),
+    ` ZZKALL: PROC(OUT);
+   DCL OUT FIXED BIN(31);
+   %INCLUDE ZZKONS;
+   CALL ZEIGE(KO_GEB, KO_ZAEHL);
+   CALL DURCH(KO_WEITER);
+   OUT = OUT + KO_ZAEHL * 100 + KO_WEITER * 1000;
+ ZEIGE: PROC(TYP, N);
+   DCL TYP CHAR(2);
+   DCL N FIXED BIN(31);
+   IF TYP = '05' THEN OUT = 1;
+   N = N + 1;
+ END ZEIGE;
+ DURCH: PROC(M);
+   DCL M FIXED BIN(31);
+   CALL ZEIGE('05', M);
+ END DURCH;
+ END ZZKALL;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZKALL"] });
+  assert.deepEqual(summary.programs[0].todos, []);
+  const include = readFileSync(join(out, "includes/ZZKONS.js"), "utf-8");
+  assert.match(include, /export const KO_GEB = "05";/);
+  assert.match(include, /export const KO_ZAEHL = \(\) =>/);
+  assert.match(include, /export const KO_WEITER = \(\) =>/);
+  const { ZZKALL } = await import(pathToFileURL(join(out, "programs/ZZKALL.js")).href);
+  assert.equal(await ZZKALL(0), 4201);
+});
+
+test("an include's record is read and written by its own module's functions, and a constant no program changes is read from there", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZSATZ"),
+    `   /* ZZSATZ  SATZ DER DATEI F, 1994 ERSTELLT */
+   DCL 1 SATZ,
+         3 TYP CHAR(1),
+         3 NR PIC '999';
+   DCL TYP_A CHAR(1) STATIC INIT('A');
+   DCL ZAEHLER FIXED BIN(31) INIT(0);
+`,
+  );
+  writeFileSync(
+    join(root, "SRC/ZZSCHR"),
+    ` ZZSCHR: PROC(OUT) OPTIONS(MAIN);
+   DCL OUT FIXED BIN(31);
+   DCL F FILE RECORD OUTPUT;
+   %INCLUDE ZZSATZ;
+   SATZ.TYP = TYP_A;
+   SATZ.NR = 7;
+   OPEN FILE(F);
+   WRITE FILE(F) FROM(SATZ);
+   CLOSE FILE(F);
+   ZAEHLER = ZAEHLER + 1;
+   OUT = ZAEHLER;
+ END ZZSCHR;
+`,
+  );
+  writeFileSync(
+    join(root, "SRC/ZZLIES"),
+    ` ZZLIES: PROC(OUT) OPTIONS(MAIN);
+   DCL OUT FIXED BIN(31);
+   DCL F FILE RECORD INPUT;
+   DCL LISTE(3, 2) CHAR(2);
+   %INCLUDE ZZSATZ;
+   OPEN FILE(F);
+   READ FILE(F) INTO(SATZ);
+   CLOSE FILE(F);
+   IF SATZ.TYP = TYP_A THEN OUT = SATZ.NR;
+ END ZZLIES;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZSCHR", "SRC/ZZLIES"] });
+  assert.deepEqual(summary.programs.map((p) => p.todos), [[], []]);
+  const include = readFileSync(join(out, "includes/ZZSATZ.js"), "utf-8");
+  assert.match(include, /export const TYP_A = .*"A"/);
+  assert.match(include, /export const ZAEHLER = \(\) =>/);
+  assert.match(include, /export function SATZ_toRecord\(area\)/);
+  assert.match(include, /export function SATZ_fromRecord\(area, text\)/);
+  assert.match(include, /1994 ERSTELLT/);
+  for (const program of ["ZZSCHR", "ZZLIES"]) {
+    const code = readFileSync(join(out, `programs/${program}.js`), "utf-8");
+    assert.doesNotMatch(code, /function SATZ_|TYP_A =|1994 ERSTELLT|%INCLUDE/);
+    assert.match(code, /ZZSATZ\.TYP_A/);
+  }
+  assert.match(readFileSync(join(out, "programs/ZZLIES.js"), "utf-8"), /@type \{string\[\]\[\]\} \(3, ?2\) CHAR\(2\)/);
+  const dataset = join(mkdtempSync(join(tmpdir(), "pli-datasets-")), "F.txt");
+  process.env.DD_F = dataset;
+  try {
+    const { ZZSCHR } = await import(pathToFileURL(join(out, "programs/ZZSCHR.js")).href);
+    assert.equal(await ZZSCHR(0), 1);
+    assert.equal(readFileSync(dataset, "utf-8"), "A007\n");
+    const { ZZLIES } = await import(pathToFileURL(join(out, "programs/ZZLIES.js")).href);
+    assert.equal(await ZZLIES(0), 7);
+  } finally {
+    delete process.env.DD_F;
+  }
 });
 
 test("comments keep their lines, on procedures, fields and inside an IF", async () => {
@@ -324,6 +622,7 @@ test("comments keep their lines, on procedures, fields and inside an IF", async 
          2 B CHAR(2);
    DCL Z FIXED BIN(31) INIT(0); /* ZAEHLER
                                    FUER ALLES */
+   A = 0;
    IF Z = 0 THEN /* IM THEN
       ZWEI */
      OUT = 2;
@@ -341,7 +640,7 @@ test("comments keep their lines, on procedures, fields and inside an IF", async 
   assert.match(code, /\/\*\*\n {3}\* @type \{number\} FIXED BIN\(31\) INIT\(0\) ZAEHLER\n {3}\* FUER ALLES\n {3}\*\/\n {2}let Z/);
   assert.match(code, /if \(Z === 0\) \{\n\s+\/\/ IM THEN\n\s+\/\/ ZWEI\n\s+OUT = 2;\n\s+\} else \{\n\s+\/\/ IM ELSE\n\s+OUT = 3;/);
   const { ZZCMT } = await import(pathToFileURL(join(out, "programs/ZZCMT.js")).href);
-  assert.deepEqual(await ZZCMT(0), { OUT: 2 });
+  assert.equal(await ZZCMT(0), 2);
 });
 
 test("a transaction whose program is not found is reported with why", async () => {
@@ -408,6 +707,10 @@ test("a transaction code runs the program only its third character, the member t
   writeFileSync(join(root, "pli/ZZS00400"), ` ZZS00400: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n END ZZS00400;\n`);
   mkdirSync(join(root, "dev"));
   writeFileSync(join(root, "dev/ZZS00400"), ` ZZS00400: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n END ZZS00400;\n`);
+  // Unrelated subprograms named alike: one called by another program, one not called, neither MAIN.
+  writeFileSync(join(root, "pli/ZZU00400"), ` ZZU00400: PROC;\n END ZZU00400;\n`);
+  writeFileSync(join(root, "pli/ZZX00400"), ` ZZX00400: PROC;\n END ZZX00400;\n`);
+  writeFileSync(join(root, "pli/ZZS00999"), ` ZZS00999: PROC OPTIONS(MAIN);\n   CALL ZZU00400;\n END ZZS00999;\n`);
   writeFileSync(
     join(root, "mfs/ZZF004"),
     `         ALPHA 'abcdefghijklmnopqrstuvwxyzßäöüÖ'
@@ -444,6 +747,60 @@ ZZF004O  MSG   TYPE=OUTPUT,SOR=(ZZF004,IGNORE)
   assert.deepEqual(summary.skipped.map((s) => s.code), ["ZZK00500"]);
   assert.ok(said.some((s) => s.startsWith("[PLG088W] the input screen mfs/ZZF005 ZZF005I sends ZZK00500")), said.join("\n"));
   assert.match(readFileSync(join(out, "transactions.js"), "utf-8"), /ZZK00400: \{ program: \(\) => import\("\.\/programs\/ZZS00400\.js"\), entry: "ZZS00400", screens: ZZF004, input: "ZZF004I" \}/);
+});
+
+test("a message program no screen reaches is an IMS Connect service taking the raw message, and the untranslated PL/I files are listed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "pli"));
+  writeFileSync(
+    join(root, "pli/ZZS00700"),
+    ` ZZS00700: PROC(IOPCB) OPTIONS(MAIN);
+   DCL IOPCB PTR;
+   DCL PLITDLI ENTRY EXTERNAL;
+   DCL GU CHAR(4) INIT('GU  ');
+   DCL ISRT CHAR(4) INIT('ISRT');
+   DCL 1 MSG, 2 LL FIXED BIN(15), 2 ZZ FIXED BIN(15), 2 TEXT CHAR(5);
+   CALL PLITDLI(3, GU, IOPCB, MSG);
+   TEXT = 'HALLO';
+   CALL PLITDLI(3, ISRT, IOPCB, MSG);
+ END ZZS00700;
+`,
+  );
+  writeFileSync(join(root, "pli/ZZS00701"), ` ZZS00701: PROC OPTIONS(MAIN);\n END ZZS00701;\n`);
+  // A screen transaction teaches the code's type letter: ZZK00400 runs ZZS00400, so the service ZZS00700 is ZZK00700.
+  writeFileSync(join(root, "pli/ZZS00400"), ` ZZS00400: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n END ZZS00400;\n`);
+  mkdirSync(join(root, "mfs"));
+  writeFileSync(join(root, "mfs/ZZF004"), `ZZF004   FMT\nKDNR     DFLD  POS=(3,20),LTH=8\n         FMTEND\nZZF004I  MSG   TYPE=INPUT,SOR=(ZZF004,IGNORE)\n         SEG\n         MFLD  'ZZK00400',LTH=8\n         MSGEND\n         END\n`);
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  /** @type {string[]} */
+  const said = [];
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, progress: (/** @type {string} */ text) => said.push(text) });
+  assert.deepEqual(summary.transactions, ["ZZK00400", "ZZK00700"]);
+  assert.deepEqual(summary.untranslated, [{ path: "pli/ZZS00701", why: "no transaction, job or translated program reaches it" }]);
+  assert.ok(said.some((s) => s.includes("pli/ZZS00701")), said.join("\n"));
+  const { handle } = await import(pathToFileURL(join(out, "server.js")).href);
+  const { status, body } = await handle("POST", "/ZZK00700", { message: "ABCDE" });
+  assert.equal(status, 200, body);
+  assert.deepEqual(JSON.parse(body).reply, ["HALLO"]);
+  const both = await Promise.all([handle("POST", "/ZZK00700", { message: "ABCDE" }), handle("POST", "/ZZK00700", { message: "FGHIJ" })]);
+  assert.deepEqual(both.map((r) => r.status), [200, 200], both.map((r) => r.body).join("\n"));
+});
+
+test("TODO.md lists every TODO once with its code marked and the lines around it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  mkdirSync(join(root, "INC"));
+  writeFileSync(join(root, "INC/ZZWARTE"), `   DCL E EVENT;\n   WAIT(E);\n`);
+  for (const name of ["ZZPTODO", "ZZPTOD2"]) {
+    writeFileSync(join(root, `SRC/${name}`), ` ${name}: PROC(OUT);\n   DCL OUT FIXED BIN(31);\n   OUT = 1;\n   %INCLUDE ZZWARTE;\n   WAIT(E);\n   OUT = 2;\n END ${name};\n`);
+  }
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZPTODO", "SRC/ZZPTOD2"] });
+  assert.equal(summary.programs.flatMap((p) => p.todos).length, 4);
+  const todo = readFileSync(join(out, "TODO.md"), "utf-8");
+  assert.match(todo, /3 TODOs in 3 files/);
+  assert.match(todo, /### INC\/ZZWARTE:2: the WAIT statement\n\nin ZZPTOD2, ZZPTODO\n\n```pli\n {4}1 {4}DCL E EVENT;\n> {3}2 {4}WAIT\(E\);\n```/);
+  assert.match(todo, /### SRC\/ZZPTODO:5: the WAIT statement\n\n```pli\n {4}2 {4}DCL OUT FIXED BIN\(31\);\n {4}3 {4}OUT = 1;\n {4}4 {4}%INCLUDE ZZWARTE;\n> {3}5 {4}WAIT\(E\);\n {4}6 {4}OUT = 2;\n {4}7 {2}END ZZPTODO;\n```/);
 });
 
 test("a graph without any transaction says why", async () => {
@@ -520,11 +877,14 @@ test("a program's ENTRY points run from their statement and give back the parame
    IF I > 3 THEN RETURN;
    IF TAB(I) = S@KEY THEN DO;
      S@IX = I;
-     TREFFER = TREFFER + 1;
+     CALL ZAEHLEN;
      RETURN;
    END;
    I = I + 1;
    GOTO NAECHST;
+ ZAEHLEN: PROC;
+   TREFFER = TREFFER + 1;
+ END ZAEHLEN;
  END ZZPTAB;
 `,
   );
@@ -538,7 +898,13 @@ test("a program's ENTRY points run from their statement and give back the parame
     ],
   );
   const { ZZRUF } = await import(pathToFileURL(join(out, "programs/ZZRUF.js")).href);
-  assert.deepEqual(await ZZRUF(0), { OUT: 220 });
+  assert.equal(await ZZRUF(0), 220);
+  const tab = readFileSync(join(out, "programs/ZZPTAB.js"), "utf-8");
+  assert.doesNotMatch(tab, /async|await|landing|catch/);
+  assert.match(tab, /^export function ZZSUCH\(S_AKEY, S_AIX\) \{$/m);
+  assert.match(tab, /^ {4}NAECHST: for \(;;\) \{$/m);
+  assert.doesNotMatch(tab, /ZZPTAB\$|goto\d|switch|break;/);
+  assert.match(tab, /^ {4}function ZAEHLEN\(\) \{$/m);
 });
 
 test("a program called again while it runs fails with PLG081E, unless it is RECURSIVE, and can run again afterwards", async () => {
@@ -648,8 +1014,8 @@ test("arrays and structures are assigned whole, by position and BY NAME; GOTO, O
   );
   /** @param {string} member */
   const program = async (member) => (await import(pathToFileURL(join(out, `programs/${member}.js`)).href))[member];
-  assert.deepEqual(await (await program("ZZP00007"))(""), { ERG: "ABZ-7ZABC5M" });
-  assert.deepEqual(await (await program("ZZP00008"))(""), { ERG: "K123E9!" });
+  assert.equal(await (await program("ZZP00007"))(""), "ABZ-7ZABC5M");
+  assert.equal(await (await program("ZZP00008"))(""), "K123E9!");
   await assert.rejects((await program("ZZP00009"))(), /PLG070E/);
   await assert.rejects((await program("ZZP00010"))(), { name: "Stop" });
 });
@@ -693,7 +1059,7 @@ test("DO with REPEAT, UNTIL and several ranges, R formats, repeated data items a
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZP00011"] });
   assert.deepEqual(summary.programs[0].todos, []);
   const { ZZP00011 } = await import(pathToFileURL(join(out, "programs/ZZP00011.js")).href);
-  assert.deepEqual(await ZZP00011(""), { ERG: "1,2,4,8,16,127956/ 1 2 3X45612AB 7" });
+  assert.equal(await ZZP00011(""), "1,2,4,8,16,127956/ 1 2 3X45612AB 7");
 });
 
 test("GET DATA fails on a name outside its data list and on text it cannot read", async () => {
@@ -741,7 +1107,7 @@ test("a DEFINED structure, scalar and array split a string and write back into i
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZP00013"] });
   assert.deepEqual(summary.programs[0].todos, []);
   const { ZZP00013 } = await import(pathToFileURL(join(out, "programs/ZZP00013.js")).href);
-  assert.deepEqual(await ZZP00013(""), { ERG: "ABCD/042/04/042R/ABCDXY7REST OF IT   " });
+  assert.equal(await ZZP00013(""), "ABCD/042/04/042R/ABCDXY7REST OF IT   ");
 });
 
 test("a LIKE structure, also a LIKE field, has fields of its own", async () => {
@@ -769,7 +1135,7 @@ test("a LIKE structure, also a LIKE field, has fields of its own", async () => {
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZP00015"] });
   assert.deepEqual(summary.programs[0].todos, []);
   const { ZZP00015 } = await import(pathToFileURL(join(out, "programs/ZZP00015.js")).href);
-  assert.deepEqual(await ZZP00015(""), { ERG: "K1UlMA1UlMS1UlM" });
+  assert.equal(await ZZP00015(""), "K1UlMA1UlMS1UlM");
 });
 
 test("masks BASED on a generic SPA area map its fields by position, also after the SPA is copied", async () => {
@@ -806,7 +1172,8 @@ test("masks BASED on a generic SPA area map its fields by position, also after t
   assert.deepEqual(summary.programs[0].todos, []);
   const { ZZP00014 } = await import(pathToFileURL(join(out, "programs/ZZP00014.js")).href);
   assert.deepEqual(await ZZP00014(0, "", 0, 0), { NR: "K1      ", BETRAG: 12.5, N: 3 });
-  await assert.rejects(ZZP00014(1, "", 0, 0), /PLG074E\] a view's field 4 \(D\)/);
+  assert.match(readFileSync(join(out, "programs/ZZP00014.js"), "utf-8"), /^export function ZZP00014\(/m);
+  await assert.rejects(async () => ZZP00014(1, "", 0, 0),/PLG074E\] a view's field 4 \(D\)/);
 });
 
 test("a batch program reads one record file to its end and writes another", async () => {
@@ -915,6 +1282,44 @@ DEF
     assert.equal(await ZZJOB01(), 4);
     assert.equal(readFileSync(join(datasets, "ZZ.KOPIE.txt"), "utf-8"), "ABC\nDEF\n");
     assert.equal(existsSync(join(datasets, "TEMP/ZZJOB01/ZWISCH.txt")), false);
+  } finally {
+    delete process.env.DATASETS;
+  }
+});
+
+test("a main program run by a step without PARM gets an empty PARM", async () => {
+  const src = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(src, "SRC"));
+  mkdirSync(join(src, "JCL"));
+  writeFileSync(
+    join(src, "SRC/ZZPARM"),
+    ` ZZPARM: PROC(P_PARM) OPTIONS(MAIN);
+   DCL P_PARM CHAR(100) VAR;
+   DCL OUT FILE STREAM OUTPUT;
+   IF INDEX(P_PARM, 'TRACE') > 0 THEN PUT FILE(OUT) LIST('TRACE');
+   ELSE PUT FILE(OUT) LIST('QUIET');
+ END ZZPARM;
+`,
+  );
+  writeFileSync(
+    join(src, "JCL/ZZJOB09"),
+    `//ZZJOB09  JOB (ACCT),'PARM',CLASS=A
+//A        EXEC PGM=ZZPARM
+//OUT      DD SYSOUT=*
+//B        EXEC PGM=ZZPARM,PARM='TRACE'
+//OUT      DD SYSOUT=*
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  generateJs(await indexed(src), src, indexer, out, { ...TEMPLATES, jobs: ["JCL/ZZJOB09"] });
+  assert.match(readFileSync(join(out, "programs/ZZPARM.js"), "utf-8"), /if \(P_PARM\.includes\("TRACE"\)\) \{/);
+  const datasets = mkdtempSync(join(tmpdir(), "pli-datasets-"));
+  process.env.DATASETS = datasets;
+  try {
+    const { ZZJOB09 } = await import(pathToFileURL(join(out, "jobs/ZZJOB09.js")).href);
+    assert.equal(await ZZJOB09(), 0);
+    assert.match(readFileSync(join(datasets, "SYSOUT/ZZJOB09/A.OUT.txt"), "utf-8"), /QUIET/);
+    assert.match(readFileSync(join(datasets, "SYSOUT/ZZJOB09/B.OUT.txt"), "utf-8"), /TRACE/);
   } finally {
     delete process.env.DATASETS;
   }
@@ -1084,9 +1489,9 @@ test("a keyed file is read, rewritten, added to and deleted from by key", async 
   process.env.FILES = files;
   writeFileSync(join(files, "KONTEN.txt"), "00000001\tMEIER         12.50\n00000002\tSCHULZ         1.00\n");
   const { ZZP00003 } = await import(pathToFileURL(join(out, "programs/ZZP00003.js")).href);
-  assert.deepEqual(await ZZP00003("00000001", false), { FEHLT: false });
+  assert.equal(await ZZP00003("00000001", false), false);
   assert.equal(readFileSync(join(files, "KONTEN.txt"), "utf-8"), "00000001\tMEIER         22.50\n00000009\tMEIER         22.50\n");
-  assert.deepEqual(await ZZP00003("00000007", false), { FEHLT: true });
+  assert.equal(await ZZP00003("00000007", false), true);
 });
 
 test("a report is read and printed with stream I/O: EDIT, LIST, DATA and STRING", async () => {
@@ -1129,7 +1534,7 @@ test("a report is read and printed with stream I/O: EDIT, LIST, DATA and STRING"
   process.env.FILES = files;
   writeFileSync(join(files, "EIN.txt"), "MEIER    12.50\nSCHULZ   20.00\n");
   const { ZZP00004 } = await import(pathToFileURL(join(out, "programs/ZZP00004.js")).href);
-  assert.deepEqual(await ZZP00004(0), { SUMME: 32.5 });
+  assert.equal(await ZZP00004(0), 32.5);
   assert.equal(
     readFileSync(join(files, "LISTE.txt"), "utf-8"),
     "\fKUNDE   BETRAG\nMEIER      12.50\nSCHULZ     20.00\n\nSUMME   32.50       \nA='ABC' N=42;\n",
@@ -1286,7 +1691,7 @@ test("IMS database calls run as SQL on a Db2 table per segment", async () => {
   process.env.SQLITE = file;
   const runtime = await import(pathToFileURL(join(out, "runtime.js")).href);
   const { ZZP00020 } = await import(pathToFileURL(join(out, "programs/ZZP00020.js")).href);
-  const { ERG } = await ZZP00020(null, null, "");
+  const ERG = await ZZP00020(null, null, "");
   delete process.env.SQLITE;
   assert.equal(ERG, "  BERT/  K3/GE/  ANNA/  K1/  K2/  K3/GB/II/  /DJ/  /DA/  /GE/  02KONTO   ");
   assert.deepEqual(
@@ -1333,5 +1738,5 @@ test("FIXED DEC with decimals stays exact: large sums, comparisons and text of c
   assert.match(code, /N = dec\(\(N \* 3\) \+ 1, 7, 0\);/);
   assert.match(code, /if \(num\(X \+ Y\) === 3\.3\)/);
   const { ZZP00021 } = await import(pathToFileURL(join(out, "programs/ZZP00021.js")).href);
-  assert.deepEqual(await ZZP00021(""), { ERG: "141993493546.86/GLEICH/3.3/3703702/141993493546.86" });
+  assert.equal(await ZZP00021(""), "141993493546.86/GLEICH/3.3/3703702/141993493546.86");
 });

@@ -32,9 +32,9 @@ import { PLI_BUILTINS, blankMargins, bytes, ddlTables } from "./source.js";
  */
 /**
  * @typedef {"char" | "varchar" | "bits" | "dec" | "pic" | "bin" | "float" | "bit" | "pointer" | "structure" | "literal" | "string" | "number" | "unknown"} Kind
- * @typedef {{ code: string, kind: Kind, v?: Variable, text?: string }} Expr
- * @typedef {{ line: number, scopes: number[], loops: string[], changed: string[], gotos: Map<string, string>, units: boolean, start?: string }} At loops: "loop", "dispatch", "group", or the JS label of a DO group a LEAVE ends; changed: the parameters the procedure returns; gotos: the dispatcher of each label in this function; units: the procedure keeps ON units; start: where the procedure's statements start, an ENTRY's name
- * @typedef {{ line: number, why: string, path?: string }} Todo path: the include the line is in, else the program's file
+ * @typedef {{ code: string, kind: Kind, v?: Variable, text?: string, contains?: string }} Expr
+ * @typedef {{ line: number, scopes: number[], loops: string[], changed: string[], gotos: Map<string, { dispatcher: string } | { block: string } | { loop: string } | { returns: Node }>, units: boolean, start?: string, alone?: boolean }} At loops: "loop", "dispatch", "group", or the JS label of a DO group a LEAVE ends; changed: the parameters the procedure returns, alone: by itself, the one changed parameter, else as an object; gotos: how a GOTO reaches each label in this function, by the dispatcher or by breaking out of the labeled block before it; units: the procedure keeps ON units; start: where the procedure's statements start, an ENTRY's name
+ * @typedef {{ line: number, why: string, path?: string, end?: number }} Todo path: the include the line is in, else the program's file; end: a statement's last line
  */
 
 /** Declarations that are not data. */
@@ -90,11 +90,12 @@ function picDigits(picture) {
 /** @param {Variable} v */
 function jsdocType(v) {
   const kind = kindOf(v);
-  if (kind === "char" || kind === "varchar" || kind === "bits") return "string";
-  if (kind === "bit") return "boolean";
-  if (kind === "pointer") return "any";
-  if (kind === "structure") return "object";
-  return kind === "unknown" ? "any" : "number";
+  const dims = v.dims ? "[]".repeat(v.dims.split(",").length) : "";
+  if (kind === "char" || kind === "varchar" || kind === "bits") return "string" + dims;
+  if (kind === "bit") return "boolean" + dims;
+  if (kind === "structure") return "object" + dims;
+  if (kind === "pointer" || kind === "unknown") return "any" + dims;
+  return "number" + dims;
 }
 
 /** A file PUT and GET write and read as text: STREAM or PRINT. @param {Variable} v */
@@ -136,6 +137,12 @@ function blank(v) {
   }
 }
 
+/** Whether `expr` is a number literal FIXED DEC(p,q) holds as it is. @param {Expr} expr @param {number} p @param {number} q */
+function fits(expr, p, q) {
+  const m = expr.code.match(/^(\d+)(?:\.(\d+))?$/);
+  return expr.kind === "number" && m !== null && m[1].replace(/^0+/, "").length <= p - q && (m[2] ?? "").length <= q;
+}
+
 /**
  * `expr` converted to the type of `v`, as PL/I's assignment does.
  * @param {Variable} v
@@ -156,11 +163,11 @@ function convert(v, expr) {
       return `varchar(${expr.code}, ${Number(v.size)})`;
     case "dec": {
       const [p, q = "0"] = (v.size ?? "5").split(",");
-      return `dec(${expr.code}, ${Number(p)}, ${Number(q)})`;
+      return fits(expr, Number(p), Number(q)) ? expr.code : `dec(${expr.code}, ${Number(p)}, ${Number(q)})`;
     }
     case "pic": {
       const [p, q] = picDigits(v.size ?? "");
-      return `dec(${expr.code}, ${p}, ${q})`;
+      return fits(expr, p, q) ? expr.code : `dec(${expr.code}, ${p}, ${q})`;
     }
     case "bin":
       return expr.kind === "bin" || (expr.kind === "number" && /^-?\d+$/.test(expr.code)) ? expr.code : `bin(${expr.code})`;
@@ -408,16 +415,46 @@ function programToJs(db, root, indexer, path) {
   // PL/I passes arguments by reference: a procedure returns the scalar
   // parameters it changes, and its callers assign them back. An ENTRY's
   // parameter is a copy of its procedure's variable, which is the one written.
-  const changedParameters = db.prepare(
-    `SELECT v.name, v.parameter FROM variables v
+  // Passing a variable to a CALL changes it when the callee changes that
+  // parameter; a callee the graph does not know is not translated, so it changes nothing.
+  const scalarParameters = db.prepare(
+    `SELECT v.id, v.name, v.parameter,
+       (SELECT w.id FROM symbols e JOIN variables w ON w.scope = e.parent AND w.name = v.name AND w.parent IS NULL
+        WHERE e.id = v.scope AND e.detail LIKE 'ENTRY%') AS own
+     FROM variables v
      WHERE v.scope = ? AND v.parameter IS NOT NULL AND v.parent IS NULL AND v.dims IS NULL AND v.type IS NOT 'STRUCTURE'
-       AND (EXISTS (SELECT 1 FROM accesses a WHERE a.variable = v.id AND a.mode = 'write')
-         OR EXISTS (SELECT 1 FROM symbols e JOIN variables w ON w.scope = e.parent AND w.name = v.name AND w.parent IS NULL JOIN accesses a ON a.variable = w.id
-                    WHERE e.id = v.scope AND e.detail LIKE 'ENTRY%' AND a.mode = 'write'))
      ORDER BY v.parameter`,
   );
-  /** @param {number} procedure */
-  const changedBy = (procedure) => /** @type {{ name: string, parameter: number }[]} */ (changedParameters.all(procedure));
+  const changesOf = db.prepare(
+    `SELECT a.mode, a.position,
+       (SELECT l.target_symbol FROM refs r JOIN links l ON l.ref = r.id
+        WHERE r.file = s.file AND r.caller IS s.caller AND r.kind = 'call' AND r.line BETWEEN s.line AND s.end_line LIMIT 1) AS callee
+     FROM accesses a JOIN statements s ON s.id = a.statement
+     WHERE a.mode != 'read' AND (a.variable = ? OR a.through = ? OR (a.variable IS NULL AND (a.name = ? OR a.name LIKE '%.' || ?)))`,
+  );
+  /** @type {Map<number, { name: string, parameter: number }[]>} */
+  const changedParameters = new Map();
+  /**
+   * @param {number} id
+   * @param {string | null} name also the accesses not resolved to a variable, by this name
+   */
+  const changed = (id, name) =>
+    /** @type {{ mode: string, position: number | null, callee: number | null }[]} */ (changesOf.all(id, id, name, name)).some(
+      (c) => c.mode === "write" || (c.callee !== null && changedBy(c.callee).some((p) => p.parameter === c.position)),
+    );
+  /**
+   * @param {number} procedure
+   * @returns {{ name: string, parameter: number }[]}
+   */
+  const changedBy = (procedure) => {
+    const known = changedParameters.get(procedure);
+    if (known) return known;
+    changedParameters.set(procedure, []); // a recursive call changes nothing more
+    const parameters = /** @type {{ id: number, name: string, parameter: number, own: number | null }[]} */ (scalarParameters.all(procedure));
+    const result = parameters.filter((p) => changed(p.id, null) || (p.own !== null && changed(p.own, null))).map((p) => ({ name: p.name, parameter: p.parameter }));
+    changedParameters.set(procedure, result);
+    return result;
+  };
   const externalCalls = new Map(
     /** @type {{ file: number, line: number, id: number, name: string, path: string, member: string }[]} */ (
       db
@@ -440,6 +477,78 @@ function programToJs(db, root, indexer, path) {
       f.member,
     ]),
   );
+  const kindsIn = db.prepare(`SELECT DISTINCT kind FROM statements WHERE caller = ?`);
+  const entriesOf = db.prepare(`SELECT 1 FROM symbols WHERE (id = ? OR parent = ?) AND detail LIKE 'ENTRY%' LIMIT 1`);
+  // An array element, TAB(I), looks like a call to the parser; its access names the variable.
+  const callsIn = db.prepare(
+    `SELECT DISTINCT r.name, l.target_symbol AS target FROM refs r LEFT JOIN links l ON l.ref = r.id
+     WHERE r.caller = ? AND r.kind IN ('call', 'invoke')
+       AND (l.target_symbol IS NOT NULL OR NOT EXISTS (
+         SELECT 1 FROM statements s JOIN accesses a ON a.statement = s.id WHERE s.caller = r.caller AND a.name = r.name AND a.variable IS NOT NULL))`,
+  );
+  /** @type {Map<number, boolean>} */
+  const waiting = new Map();
+  const entryOf = db.prepare(`SELECT parent FROM symbols WHERE id = ? AND detail LIKE 'ENTRY%'`);
+  // Also the calls of its entries and internal procedures, at any depth.
+  const callsUnder = db.prepare(
+    `/* full scan */ WITH RECURSIVE inside(id) AS (SELECT ? UNION SELECT s.id FROM symbols s JOIN inside i ON s.parent = i.id)
+     SELECT 1 FROM refs r JOIN inside i ON r.caller = i.id WHERE r.kind IN ('call', 'invoke') LIMIT 1`,
+  );
+  const gotoInside = db.prepare(`SELECT 1 FROM symbols p JOIN statements s ON s.caller = p.id WHERE p.parent = ? AND s.kind = 'goto' LIMIT 1`);
+  /**
+   * Whether a procedure has to be async: it does I/O, has ON units, an
+   * internal procedure that GOTOs out of itself, or calls one that is async
+   * or that the graph does not know. The others are plain functions. An
+   * ENTRY is async when its procedure is.
+   * @param {number} procedure
+   * @returns {boolean}
+   */
+  const waits = (procedure) => {
+    const known = waiting.get(procedure);
+    if (known !== undefined) return known;
+    waiting.set(procedure, true); // a recursive call waits
+    const entry = /** @type {{ parent: number } | undefined} */ (entryOf.get(procedure));
+    if (entry) {
+      const result = waits(entry.parent);
+      waiting.set(procedure, result);
+      return result;
+    }
+    const kinds = /** @type {{ kind: string }[]} */ (kindsIn.all(procedure)).map((k) => k.kind);
+    const called = /** @type {{ name: string, target: number | null }[]} */ (callsIn.all(procedure));
+    const result =
+      kinds.some((k) => !SYNC_KINDS.has(k)) ||
+      Boolean(gotoInside.get(procedure)) ||
+      called.some((c) => {
+        if (c.target === null) return !SYNC_BUILTINS.has(c.name.toUpperCase());
+        const own = c.target === procedure || /** @type {{ parent: number } | undefined} */ (entryOf.get(c.target))?.parent === procedure;
+        return !own && waits(c.target);
+      });
+    waiting.set(procedure, result);
+    return result;
+  };
+  /** @type {Map<number, string | undefined>} */
+  const constants = new Map();
+  /**
+   * The include whose module exports `v` as a constant: a scalar of an
+   * include with an INIT that no program changes, read from there.
+   * @param {Variable} v
+   */
+  const constantInclude = (v) => {
+    if (constants.has(v.id)) return constants.get(v.id);
+    const member = includeMembers.get(v.file);
+    const name = v.name.toUpperCase();
+    const constant =
+      member &&
+      v.parent === null &&
+      !v.dims &&
+      !v.external &&
+      v.init !== null &&
+      ["STATIC", "AUTOMATIC", "CONSTANT"].includes(v.storage ?? "") &&
+      kindOf(v) !== "structure" &&
+      !changed(v.id, name);
+    constants.set(v.id, constant ? member : undefined);
+    return constants.get(v.id);
+  };
   /** @type {Set<string>} the variables ALLOCATE makes */
   const allocated = new Set(
     allOfType("allocate_item")
@@ -460,10 +569,19 @@ function programToJs(db, root, indexer, path) {
   const layouts = new Map();
   /** @type {string[]} the module variables: the procedures' STATIC ones */
   const statics = [];
-  /** @type {Map<string, string>} each cursor's SELECT */
+  /** @type {Map<string, { text: string, column: number }>} each cursor's SELECT and the source column it starts at */
   const cursors = new Map();
   const usesSql = roots.some((r) => /EXEC\s+SQL/i.test(r.text));
-  const gotoTargets = new Set(allOfType("goto_statement").map((g) => g?.childForFieldName("label")?.text.toUpperCase() ?? ""));
+  /** @type {Map<string, Node[]>} the GOTOs to each label */
+  const gotosTo = new Map();
+  for (const g of allOfType("goto_statement")) {
+    if (!g) continue;
+    const label = g.childForFieldName("label")?.text.toUpperCase() ?? "";
+    const gotos = gotosTo.get(label) ?? [];
+    gotos.push(g);
+    gotosTo.set(label, gotos);
+  }
+  const gotoTargets = new Set(gotosTo.keys());
   for (const entry of allOfType("entry_statement")) {
     for (const prefix of entry?.parent?.namedChildren.filter((c) => c?.type === "statement_prefix") ?? []) gotoTargets.add(prefix?.childForFieldName("label")?.text.toUpperCase() ?? "");
   }
@@ -501,7 +619,7 @@ function programToJs(db, root, indexer, path) {
 
   /** @param {Node} node @param {number} depth @param {string} why */
   const todoStatement = (node, depth, why) => {
-    todos.push({ path: current.path, line: lineOf(node), why });
+    todos.push({ path: current.path, line: lineOf(node), why, end: node.endPosition.row + 1 });
     failed.add(node.id);
     emit(depth, `// TODO: ${why}, line ${lineOf(node)}:`);
     for (const line of node.text.split("\n")) emit(depth, `//   ${line.trim()}`);
@@ -545,7 +663,8 @@ function programToJs(db, root, indexer, path) {
     const rest = subscripts.map((s) => expr(s, at));
     let code = "";
     for (const [i, x] of chain.entries()) {
-      code += i === 0 ? (x.external ? "EXTERNAL." : "") + js(x.name) + (overlaidScalars.has(x.id) ? ".$" : "") : `.${keys.get(x.id)}`;
+      const constant = i === 0 && constantInclude(x);
+      code += i === 0 ? (x.external ? "EXTERNAL." : constant ? `${js(constant)}.` : "") + js(x.name) + (overlaidScalars.has(x.id) ? ".$" : "") : `.${keys.get(x.id)}`;
       for (const bound of x.dims ? bounds(x.dims) : []) {
         const s = rest.shift();
         if (!s) break;
@@ -580,7 +699,7 @@ function programToJs(db, root, indexer, path) {
         if (args[0]?.v && args[0].kind === "char") return { code: String(charLength(args[0].v)), kind: "number" };
         return { code: `${asString(args[0])}.length`, kind: "number" };
       case "INDEX":
-        return { code: `(${asString(args[0])}.indexOf(${codes[1]}) + 1)`, kind: "number" };
+        return { code: `(${asString(args[0])}.indexOf(${codes[1]}) + 1)`, kind: "number", contains: `${asString(args[0])}.includes(${codes[1]})` };
       case "VERIFY":
         return { code: `verify(${asString(args[0])}, ${codes[1]})`, kind: "number" };
       case "TRIM":
@@ -654,7 +773,7 @@ function programToJs(db, root, indexer, path) {
         if (args[0]?.kind !== "structure") break;
         const record = recordArea(argNodes[0], at);
         if (typeof record === "string") return todoExpr(node, record, at);
-        return { code: `encode(${record.area.code}, ${record.layout})`, kind: "string" };
+        return { code: record.text ? `${record.text.to}(${record.area.code})` : record.area.code, kind: "string" };
       }
     }
     return todoExpr(node, `the built-in ${name}`, at);
@@ -678,11 +797,14 @@ function programToJs(db, root, indexer, path) {
       if (!external) return todoExpr(node, `${names[0]} is an external entry not in the graph`, at);
       imports.set(js(external.name), external.member);
       calls.add(external.path);
-      return { code: `(await ${js(external.name)}(${args.map((a) => expr(a, at).code).join(", ")}))`, kind: "unknown" };
+      const call = `${js(external.name)}(${args.map((a) => expr(a, at).code).join(", ")})`;
+      return { code: waits(external.id) ? `(await ${call})` : call, kind: "unknown" };
     }
     if (v) return pathOf(v, args, node, at);
     if (names.length === 1 && procedureNames.has(names[0])) {
-      return { code: `(await ${js(names[0])}(${args.map((a) => expr(a, at).code).join(", ")}))`, kind: "unknown" };
+      const internal = procedures.find((p) => p.name.toUpperCase() === names[0]);
+      const call = `${js(names[0])}(${args.map((a) => expr(a, at).code).join(", ")})`;
+      return { code: !internal || waits(internal.id) ? `(await ${call})` : call, kind: "unknown" };
     }
     if (names.length === 1 && PLI_BUILTINS.includes(names[0])) return builtin(names[0], args, node, at);
     return todoExpr(node, `${names.join(".")} is not declared`, at);
@@ -735,6 +857,14 @@ function programToJs(db, root, indexer, path) {
             literal.kind === "literal" && other.v && other.kind === "char" && literal.text !== undefined && literal.text.length < charLength(other.v)
               ? { ...literal, code: JSON.stringify(literal.text.padEnd(charLength(other.v))) }
               : literal;
+          const blank = (/** @type {Expr} */ e) => e.kind === "literal" && e.text !== undefined && e.text.trim() === "";
+          const equality = comparisons[operator] === "===" || comparisons[operator] === "!==";
+          if (left.contains && right.code === "0") {
+            if (comparisons[operator] === "!==" || comparisons[operator] === ">") return { code: left.contains, kind: "bit" };
+            if (comparisons[operator] === "===" || comparisons[operator] === "<=") return { code: `!${left.contains}`, kind: "bit" };
+          }
+          if (equality && blank(right) && left.kind === "char") return { code: `${left.code}.trim() ${comparisons[operator]} ""`, kind: "bit" };
+          if (equality && blank(left) && right.kind === "char") return { code: `${right.code}.trim() ${comparisons[operator]} ""`, kind: "bit" };
           left = computed(leftNode, pad(left, right));
           right = computed(rightNode, pad(right, left));
           return { code: `${left.code} ${comparisons[operator]} ${right.code}`, kind: "bit" };
@@ -863,7 +993,16 @@ function programToJs(db, root, indexer, path) {
       emit(depth, `const ${js(v.name)} = new RecordFile(${JSON.stringify(v.name.toUpperCase())}, { keyed: ${/\bKEYED\b/i.test(v.attributes)}, mode: ${mode ? JSON.stringify(mode) : "null"} });`);
       return;
     }
-    const doc = [v.storage === "IMPLICIT" ? "implicitly declared" : v.attributes, v.comment].filter(Boolean).join(" ");
+    // An include's comments are in its module, not repeated in each program that includes it.
+    const comment = includeMembers.has(v.file) && !constantInclude(v) ? null : v.comment;
+    const doc = [v.storage === "IMPLICIT" ? "implicitly declared" : v.attributes, comment].filter(Boolean).join(" ");
+    const constant = constantInclude(v);
+    if (constant) {
+      const exports = includes.get(constant) ?? new Map();
+      includes.set(constant, exports);
+      exports.set(js(v.name), `${jsdoc(`@type {${jsdocType(v)}} ${doc}`, 0)}\nexport const ${js(v.name)} = ${initial(v, 0, at)};`);
+      return;
+    }
     if (kindOf(v) !== "structure") emit(depth, jsdoc(`@type {${jsdocType(v)}} ${doc}`, depth));
     else if (doc) emit(depth, jsdoc(doc, depth));
     const base = v.storage === "BASED" && v.base ? parameters.get(v.base.toUpperCase()) : undefined;
@@ -922,27 +1061,92 @@ function programToJs(db, root, indexer, path) {
     return fields.slice(header);
   };
 
-  const LAYOUT_KINDS = {
-    record: { suffix: "RECORD", where: "a record" },
-    overlay: { suffix: "FIELDS", where: "a segment" },
-    message: { suffix: "LAYOUT", where: "a message, after LL and ZZ" },
-  };
   /**
-   * The name of the module constant holding a structure's layout, written once.
-   * @param {Variable} area @param {"message" | "record" | "overlay"} mode
+   * The name of the module constant holding a segment I/O area's layout for dli, written once.
+   * @param {Variable} area
    * @returns {{ name: string } | string} the reason when it has no layout
    */
-  const layoutConstant = (area, mode) => {
-    const { suffix, where } = LAYOUT_KINDS[mode];
-    const name = `${js(area.qualified.replace(/\./g, "_"))}_${suffix}`;
+  const segmentLayout = (area) => {
+    const name = `${js(area.qualified.replace(/\./g, "_"))}_FIELDS`;
     if (layouts.has(name)) return { name };
     try {
-      const fields = layoutOf(area, mode).map((f) => `  ${f},`).join("\n");
-      layouts.set(name, `/** Where the fields of ${area.qualified} lie in ${where}. @type {import("../runtime.js").Layout} */\nconst ${name} = [\n${fields}\n];`);
+      const fields = layoutOf(area, "overlay").map((f) => `  ${f},`).join("\n");
+      layouts.set(name, `/** Where the fields of ${area.qualified} lie in a segment. @type {import("../runtime.js").Layout} */\nconst ${name} = [\n${fields}\n];`);
       return { name };
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
+  };
+
+  /** A field of a structure as JavaScript, `area` being the structure. @param {string} area @param {(string | number)[]} path */
+  const fieldCode = (area, path) => area + path.map((k) => (typeof k === "number" ? `[${k}]` : /^[A-Za-z_$][\w$]*$/.test(k) ? `.${k}` : `[${JSON.stringify(k)}]`)).join("");
+
+  /**
+   * The module functions reading a structure from the text of a record or
+   * message and writing it as one, each field a slice at a fixed offset; written once.
+   * @param {Variable} area @param {"message" | "record"} mode
+   * @returns {{ from: string, to: string } | string} the reason when it has no layout
+   */
+  const textFunctions = (area, mode) => {
+    const base = js(area.qualified.replace(/\./g, "_"));
+    const kind = mode === "message" ? "Message" : "Record";
+    const own = { from: `${base}_from${kind}`, to: `${base}_to${kind}` };
+    // A structure of an include has its functions in the include's module, shared by every program.
+    /** @type {string} */
+    const member = (area.parent === null && likesNothing(area) && includeMembers.get(area.file)) || "";
+    const shared = member ? (includes.get(member) ?? new Map()) : null;
+    if (shared) includes.set(member, shared);
+    const names = shared ? { from: `${js(member)}.${own.from}`, to: `${js(member)}.${own.to}` } : own;
+    const functions = shared ?? layouts;
+    if (functions.has(own.from)) return names;
+    /** @type {[(string | number)[], string, string, number][]} */
+    let fields;
+    try {
+      fields = layoutOf(area, mode).map((f) => JSON.parse(f));
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    const where = mode === "message" ? "the text of a message, after LL and ZZ" : "the text of a record";
+    const reads = [];
+    const writes = [];
+    let start = 0;
+    for (const [path, type, size, length] of fields) {
+      const field = fieldCode("area", path);
+      const slice = `text.slice(${start}, ${start + length})`;
+      start += length;
+      if (type === "CHAR") reads.push(`${field} = ${slice}.padEnd(${length});`);
+      else if (type === "PIC") reads.push(`${field} = fromPic(${slice}, ${JSON.stringify(size)});`);
+      else if (type === "BIT") reads.push(`${field} = ${slice} === "1";`);
+      else reads.push(`${field} = Number(${slice}) || 0;`);
+      const decimals = Number(size.split(",")[1] ?? 0);
+      if (type === "CHAR") writes.push(`char(${field}, ${length})`);
+      else if (type === "PIC") writes.push(`toPic(${field}, ${JSON.stringify(size)})`);
+      else if (type === "BIT") writes.push(`${field} ? "1" : "0"`);
+      else writes.push(`${decimals ? `${field}.toFixed(${decimals})` : `String(${field})`}.padStart(${length}).slice(-${length})`);
+    }
+    const exported = shared ? "export " : "";
+    functions.set(
+      own.from,
+      [
+        `/** Fills ${area.qualified} from ${where}; nothing when there is none. @param {any} area @param {string | null} text */`,
+        `${exported}function ${own.from}(area, text) {`,
+        "  if (text === null) return;",
+        ...reads.map((r) => `  ${r}`),
+        "}",
+      ].join("\n"),
+    );
+    functions.set(
+      own.to,
+      [
+        `/** ${area.qualified} as ${where}. @param {any} area */`,
+        `${exported}function ${own.to}(area) {`,
+        "  return [",
+        ...writes.map((w) => `    ${w},`),
+        `  ].join("");`,
+        "}",
+      ].join("\n"),
+    );
+    return names;
   };
 
   /** The record file a reference means, null when it is no declared record file. @param {Node | null | undefined} node @param {At} at */
@@ -1197,19 +1401,19 @@ function programToJs(db, root, indexer, path) {
   };
 
   /**
-   * The area a record is read into or written from, and its layout: a
-   * structure's is a module constant, a whole CHAR has none.
+   * The area a record is read into or written from, and for a structure the
+   * module functions reading and writing it as text; a whole CHAR has none.
    * @param {Node} node
    * @param {At} at
-   * @returns {{ area: Expr, layout: string } | string} the reason when it cannot be one
+   * @returns {{ area: Expr, text: { from: string, to: string } | null } | string} the reason when it cannot be one
    */
   const recordArea = (node, at) => {
     const area = expr(node, at);
     if (!area.v) return `the record area ${node.text} is not a variable`;
-    if (area.kind === "char" || area.kind === "varchar") return { area, layout: "null" };
+    if (area.kind === "char" || area.kind === "varchar") return { area, text: null };
     if (area.kind !== "structure") return `the record area ${node.text} is neither a structure nor CHAR`;
-    const layout = layoutConstant(area.v, "record");
-    return typeof layout === "string" ? layout : { area, layout: layout.name };
+    const text = textFunctions(area.v, "record");
+    return typeof text === "string" ? text : { area, text };
   };
 
   /** A key as the text a keyed file holds. @param {Node} node @param {At} at */
@@ -1245,15 +1449,15 @@ function programToJs(db, root, indexer, path) {
     if (!areaNode) return todoStatement(node, depth, `${verb} without ${verb === "READ" ? "INTO" : "FROM"}`);
     const record = recordArea(areaNode, at);
     if (typeof record === "string") return todoStatement(node, depth, record);
-    const { area, layout } = record;
-    if (verb !== "READ") return emit(depth, `await ${name}.${verb.toLowerCase()}(${area.code}, ${layout}${key});`);
-    const read = `await ${name}.read(${layout === "null" ? "null" : area.code}, ${layout}${key})`;
+    const { area, text } = record;
+    if (verb !== "READ") return emit(depth, `await ${name}.${verb.toLowerCase()}(${text ? `${text.to}(${area.code})` : area.code}${key});`);
+    const read = `await ${name}.read(${key.slice(2)})`;
     const keyTo = options.KEYTO && expr(options.KEYTO, at);
     if (keyTo && !keyTo.v) return todoStatement(node, depth, `KEYTO ${options.KEYTO.text}, which is not a variable`);
-    if (layout === "null" && keyTo) return todoStatement(node, depth, "READ INTO a CHAR with KEYTO");
-    if (layout === "null") return emit(depth, `${area.code} = ${convert(/** @type {Variable} */ (area.v), { code: `(${read})?.text ?? ${area.code}`, kind: "string" })};`);
-    if (keyTo) return emit(depth, `${keyTo.code} = ${convert(/** @type {Variable} */ (keyTo.v), { code: `(${read})?.key ?? ${keyTo.code}`, kind: "string" })};`);
-    emit(depth, `${read};`);
+    if (!text && keyTo) return todoStatement(node, depth, "READ INTO a CHAR with KEYTO");
+    if (!text) return emit(depth, `${area.code} = ${convert(/** @type {Variable} */ (area.v), { code: `(${read}) ?? ${area.code}`, kind: "string" })};`);
+    emit(depth, `${text.from}(${area.code}, ${read});`);
+    if (keyTo) emit(depth, `${keyTo.code} = ${convert(/** @type {Variable} */ (keyTo.v), { code: `${name}.lastKey ?? ${keyTo.code}`, kind: "string" })};`);
   };
 
   /** @param {Node} node a call_statement @param {number} depth @param {At} at */
@@ -1275,7 +1479,7 @@ function programToJs(db, root, indexer, path) {
         let areaCode = area.code;
         let layout = "null";
         if (kindOf(area.v) === "structure") {
-          const fields = layoutConstant(area.v, "overlay");
+          const fields = segmentLayout(area.v);
           if (typeof fields === "string") return todoStatement(node, depth, fields);
           layout = fields.name;
         } else areaCode = `new Ref(() => ${area.code}, (v) => { ${area.code} = v; })`;
@@ -1287,9 +1491,12 @@ function programToJs(db, root, indexer, path) {
         const area = variableAt(d.io_area.toUpperCase(), at);
         const pcb = variableAt(d.pcb.toUpperCase(), at);
         if (!area || !pcb || kindOf(area) !== "structure") return todoStatement(node, depth, `the I/O area ${d.io_area} is not a structure`);
-        const layout = layoutConstant(area, "message");
-        if (typeof layout === "string") return todoStatement(node, depth, layout);
-        return emit(depth, `await ims.${fn.toLowerCase()}(${pathOf(pcb, [], node, at).code}, ${pathOf(area, [], node, at).code}, ${layout.name});`);
+        const text = textFunctions(area, "message");
+        if (typeof text === "string") return todoStatement(node, depth, text);
+        const pcbCode = pathOf(pcb, [], node, at).code;
+        const areaCode = pathOf(area, [], node, at).code;
+        if (fn === "GU") return emit(depth, `${text.from}(${areaCode}, await ims.gu(${pcbCode}));`);
+        return emit(depth, `await ims.isrt(${pcbCode}, ${text.to}(${areaCode}));`);
       }
       if (d.pcb_parameter === 1 && fn === "GN") {
         const pcb = d.pcb ? variableAt(d.pcb.toUpperCase(), at) : undefined;
@@ -1320,11 +1527,29 @@ function programToJs(db, root, indexer, path) {
    */
   const invoke = (name, procedure, argNodes, at) => {
     const args = argNodes.map((a) => expr(a, at));
-    const call = `await ${js(name)}(${args.map((a) => a.code).join(", ")})`;
+    const call = `${waits(procedure) ? "await " : ""}${js(name)}(${args.map((a) => a.code).join(", ")})`;
     const back = changedBy(procedure)
       .map((p) => ({ key: js(p.name), arg: args[p.parameter - 1] }))
       .filter((p) => p.arg?.v && p.arg.kind !== "structure");
-    return back.length ? `({ ${back.map((p) => `${p.key}: ${p.arg.code}`).join(", ")} } = ${call});` : `${call};`;
+    if (!back.length) return `${call};`;
+    if (returnsAlone(procedure)) return `${back[0].arg.code} = ${call};`;
+    return `({ ${back.map((p) => `${p.key}: ${p.arg.code}`).join(", ")} } = ${call});`;
+  };
+
+  /**
+   * Whether a procedure returns the one parameter it changes by itself. A
+   * procedure with ENTRYs returns an object: each entry changes others.
+   * @param {number} procedure
+   */
+  const returnsAlone = (procedure) => changedBy(procedure).length === 1 && !entriesOf.get(procedure, procedure);
+
+  /** @param {At} at */
+  const changedValue = (at) => (at.alone ? at.changed[0] : `{ ${at.changed.join(", ")} }`);
+
+  /** The source column of a character of a statement. @param {Node} node @param {number} index */
+  const columnOf = (node, index) => {
+    const newline = node.text.lastIndexOf("\n", index - 1);
+    return newline < 0 ? node.startPosition.column + index : index - newline - 1;
   };
 
   /** @param {Node} node an exec_statement @param {number} depth @param {At} at */
@@ -1332,8 +1557,9 @@ function programToJs(db, root, indexer, path) {
     const text = node.text
       .replace(/^EXEC\s+SQL\s+/i, "")
       .replace(/\s*;\s*$/, "")
-      .replace(/\s*\n\s*/g, " ")
       .trim();
+    const oneLine = text.replace(/\s*\n\s*/g, " ");
+    const column = columnOf(node, node.text.length - node.text.replace(/^EXEC\s+SQL\s+/i, "").length);
     const verb = text.split(/\s+/)[0].toUpperCase();
     const sqlcode = variableAt("SQLCODE", at);
     const sqlcodeCode = sqlcode ? pathOf(sqlcode, [], node, at).code : "SQLCODE";
@@ -1342,12 +1568,23 @@ function programToJs(db, root, indexer, path) {
       const v = variableAt(name, at);
       return v ? pathOf(v, [], node, at) : todoExpr(node, `the host variable ${name} is not declared`, at);
     };
-    /** @param {string} sqlText */
-    const withParams = (sqlText) => {
+    /**
+     * SQL on several lines as a template literal under `indent`, each line
+     * as far right of the first as in the source, where the first is at `column`.
+     * @param {string} sqlText @param {number} column @param {number} indent
+     */
+    const sqlString = (sqlText, column, indent) => {
+      const lines = sqlText.split("\n").filter((l, i) => i === 0 || l.trim());
+      if (lines.length === 1) return JSON.stringify(sqlText.trim());
+      const rest = lines.slice(1).map((l) => "  ".repeat(indent) + " ".repeat(Math.max(0, l.length - l.trimStart().length - column)) + l.trim());
+      return "`" + [lines[0].trim(), ...rest].join("\n").replace(/[\\`]/g, "\\$&").replace(/\$\{/g, "\\${") + "`";
+    };
+    /** @param {string} sqlText @param {number} column @param {number} indent */
+    const withParams = (sqlText, column, indent) => {
       const found = hostVariables(sqlText);
       let out = sqlText;
       for (const h of [...found].reverse()) out = out.slice(0, h.index) + "?" + out.slice(h.index + h.length);
-      return `${JSON.stringify(out)}, [${found.map((h) => host(h.name).code).join(", ")}]`;
+      return `${sqlString(out, column, indent)}, [${found.map((h) => host(h.name).code).join(", ")}]`;
     };
     /** @param {string} targets @param {string} row */
     const assignInto = (targets, row) => {
@@ -1357,14 +1594,14 @@ function programToJs(db, root, indexer, path) {
         if (h.indicator) emit(depth + 2, `${host(h.indicator).code} = ${row}[${i}] === null ? -1 : 0;`);
       }
     };
-    if (verb === "INCLUDE" || (verb === "DECLARE" && /\bTABLE\b/i.test(text)) || /^(BEGIN|END)\s+DECLARE\b/i.test(text)) return emit(depth, `// EXEC SQL ${text}`);
+    if (verb === "INCLUDE" || (verb === "DECLARE" && /\bTABLE\b/i.test(text)) || /^(BEGIN|END)\s+DECLARE\b/i.test(text)) return emit(depth, `// EXEC SQL ${oneLine}`);
     const cursor = DECLARE_CURSOR.exec(text);
     if (cursor) return emit(depth, `// EXEC SQL DECLARE ${cursor[1].toUpperCase()} CURSOR: run at its OPEN`);
     const open = /^OPEN\s+(\S+)$/i.exec(text);
     if (open) {
       const select = cursors.get(open[1].toUpperCase());
       if (!select) return todoStatement(node, depth, `the cursor ${open[1]} is not declared`);
-      emit(depth, `CURSORS.${js(open[1])} = await openCursor(${withParams(select)});`);
+      emit(depth, `CURSORS.${js(open[1])} = await openCursor(${withParams(select.text, select.column, depth + 1)});`);
       return emit(depth, `${sqlcodeCode} = CURSORS.${js(open[1])}.sqlcode;`);
     }
     const fetch = /^FETCH\s+(?:NEXT\s+)?(?:FROM\s+)?(\S+)\s+INTO\s+(.*)$/is.exec(text);
@@ -1387,7 +1624,7 @@ function programToJs(db, root, indexer, path) {
     }
     const selectInto = /^(SELECT\b.*?)\bINTO\b(.*?)\b(FROM\b.*)$/is.exec(text);
     emit(depth, "{");
-    emit(depth + 1, `const result = await sql(${withParams(selectInto ? `${selectInto[1]}${selectInto[3]}` : text)});`);
+    emit(depth + 1, `const result = await sql(${withParams(selectInto ? selectInto[1] + `INTO${selectInto[2]}`.replace(/[^\n]/g, " ") + selectInto[3] : text, column, depth + 2)});`);
     emit(depth + 1, `${sqlcodeCode} = result.sqlcode;`);
     if (selectInto) {
       emit(depth + 1, "if (result.rows.length) {");
@@ -1403,38 +1640,120 @@ function programToJs(db, root, indexer, path) {
       ? node.namedChildren.filter((c) => c?.type === "statement_prefix").map((c) => c?.childForFieldName("label")?.text.toUpperCase() ?? "")
       : [];
 
+  /** Whether `node` lies in `ancestor` outside any ON unit or procedure in it. @param {Node} node @param {Node} ancestor */
+  const sameUnit = (node, ancestor) => {
+    for (let n = node.parent; n; n = n.parent) {
+      if (n.id === ancestor.id) return true;
+      if (n.type === "on_statement" || n.type === "procedure_statement") return false;
+    }
+    return false;
+  };
+
   /**
-   * Statements in order. When a GOTO goes to one of them, they run in a
-   * dispatcher: a loop around a switch with a case per label, which a GOTO
-   * in the same function enters with `continue`, and one from an ON unit or
-   * an internal procedure by throwing GoTo.
+   * Statements in order. When only GOTOs before a label in the same list
+   * go to it, the statements before it are a labeled block the GOTO breaks
+   * out of. Any other GOTO makes them run in a dispatcher: a loop around a
+   * switch with a case per label, which a GOTO in the same function enters
+   * with `continue`, and one from an ON unit or an internal procedure by
+   * throwing GoTo.
    * @param {(Node | null)[]} nodes @param {number} depth @param {At} at
    */
   const statementList = (nodes, depth, at) => {
     const targets = nodes.flatMap((n) => (n ? labelsOf(n).filter((l) => gotoTargets.has(l)) : []));
     const start = at.start ?? '""';
+    const entered = at.start !== undefined;
     at = { ...at, start: undefined };
     if (!targets.length) {
       for (const node of nodes) if (node && node.type !== "end_statement") statement(node, depth, at);
       return;
     }
+
+    const first = nodes.find((n) => n !== null);
+    const forward =
+      !entered &&
+      first &&
+      targets.every((label) => {
+        const target = nodes.find((n) => n && labelsOf(n).includes(label));
+        const gotos = gotosTo.get(label) ?? [];
+        return target?.parent && gotos.length && gotos.every((g) => g.startIndex >= first.startIndex && g.startIndex < target.startIndex && sameUnit(g, /** @type {Node} */ (target.parent)));
+      });
+    if (forward) {
+      // A GOTO to a RETURN is that RETURN.
+      const returnAt = (/** @type {string} */ label) =>
+        nodes.find((n) => n && labelsOf(n).includes(label))?.namedChildren.find((c) => c?.type === "return_statement") ?? undefined;
+      /** @type {[string, { block: string } | { returns: Node }][]} */
+      const jumps = targets.map((l) => {
+        const returns = returnAt(l);
+        return [l, returns ? { returns } : { block: js(l) }];
+      });
+      const blocks = jumps.filter(([, j]) => "block" in j).map(([l]) => l);
+      const inner = { ...at, gotos: new Map([...at.gotos, ...jumps]) };
+      [...blocks].reverse().forEach((label, i) => emit(depth + i, `${js(label)}: {`));
+      let open = blocks.length;
+      for (const node of nodes) {
+        if (!node) continue;
+        for (const label of labelsOf(node)) {
+          if (!blocks.includes(label)) continue;
+          open--;
+          emit(depth + open, "}");
+        }
+        if (node.type !== "end_statement") statement(node, depth + open, inner);
+      }
+      return;
+    }
+
+    // One label that only GOTOs after it go back to: a loop from the label on.
+    const loopLabel = targets.length === 1 && !entered ? targets[0] : undefined;
+    const loopAt = loopLabel === undefined ? -1 : nodes.findIndex((n) => n && labelsOf(n).includes(loopLabel));
+    const head = nodes[loopAt];
+    const backward =
+      head?.parent &&
+      !head.namedChildren.some((c) => c?.type === "do_statement") &&
+      (gotosTo.get(/** @type {string} */ (loopLabel)) ?? []).every((g) => g.startIndex >= head.startIndex && sameUnit(g, /** @type {Node} */ (head.parent)));
+    if (backward && loopLabel !== undefined) {
+      for (const node of nodes.slice(0, loopAt)) if (node && node.type !== "end_statement") statement(node, depth, at);
+      const rest = nodes.slice(loopAt);
+      const last = lastStatement(rest);
+      const repeats = last?.type === "goto_statement" && last.childForFieldName("label")?.text.toUpperCase() === loopLabel;
+      const loop = js(loopLabel);
+      const inner = { ...at, loops: [...at.loops, /** @type {"dispatch"} */ ("dispatch")], gotos: new Map([...at.gotos, [loopLabel, { loop }]]) };
+      emit(depth, `${loop}: for (;;) {`);
+      for (const node of rest) {
+        if (!node || node.type === "end_statement") continue;
+        if (repeats && node.id === last?.id) {
+          statements++;
+          continue;
+        }
+        statement(node, depth + 1, inner);
+      }
+      if (!repeats) emit(depth + 1, "break;");
+      emit(depth, "}");
+      return;
+    }
+
     const name = `goto${++dispatchers}`;
-    const inner = { ...at, loops: [...at.loops, /** @type {"dispatch"} */ ("dispatch")], gotos: new Map([...at.gotos, ...targets.map((l) => /** @type {[string, string]} */ ([l, name]))]) };
+    const inner = { ...at, loops: [...at.loops, /** @type {"dispatch"} */ ("dispatch")], gotos: new Map([...at.gotos, ...targets.map((l) => /** @type {[string, { dispatcher: string }]} */ ([l, { dispatcher: name }]))]) };
+    // Only a GOTO from an ON unit or an internal procedure arrives as a thrown GoTo.
+    const parent = /** @type {Node} */ (first?.parent);
+    const thrown = targets.some((label) => (gotosTo.get(label) ?? []).some((g) => !sameUnit(g, parent)));
+    const cases = thrown ? depth + 3 : depth + 2;
     emit(depth, `let ${name} = ${start};`);
     emit(depth, `${name}: for (;;) {`);
-    emit(depth + 1, "try {");
-    emit(depth + 2, `switch (${name}) {`);
-    emit(depth + 3, `case "":`);
+    if (thrown) emit(depth + 1, "try {");
+    emit(cases - 1, `switch (${name}) {`);
+    emit(cases, `case "":`);
     for (const node of nodes) {
       if (!node) continue;
-      for (const label of labelsOf(node).filter((l) => gotoTargets.has(l))) emit(depth + 3, `case ${JSON.stringify(label)}:`);
-      if (node.type !== "end_statement") statement(node, depth + 4, inner);
+      for (const label of labelsOf(node).filter((l) => gotoTargets.has(l))) emit(cases, `case ${JSON.stringify(label)}:`);
+      if (node.type !== "end_statement") statement(node, cases + 1, inner);
     }
-    emit(depth + 2, "}");
-    emit(depth + 1, "} catch (error) {");
-    emit(depth + 2, `${name} = await landing(error, [${targets.map((l) => JSON.stringify(l)).join(", ")}]);`);
-    emit(depth + 2, `continue ${name};`);
-    emit(depth + 1, "}");
+    emit(cases - 1, "}");
+    if (thrown) {
+      emit(depth + 1, "} catch (error) {");
+      emit(depth + 2, `${name} = await landing(error, [${targets.map((l) => JSON.stringify(l)).join(", ")}]);`);
+      emit(depth + 2, `continue ${name};`);
+      emit(depth + 1, "}");
+    }
     emit(depth + 1, "break;");
     emit(depth, "}");
   };
@@ -1442,29 +1761,44 @@ function programToJs(db, root, indexer, path) {
   /** The statements of a DO group, or the one statement. @param {Node} node @param {number} depth @param {At} at */
   const body = (node, depth, at) => {
     if (node.type !== "do_statement" || node.namedChildren.some((c) => c?.type === "do_specification")) return statement(node, depth, at);
-    const group = groupOf(node);
-    if (group === "group") return statementList(node.namedChildren, depth, { ...at, loops: [...at.loops, group] });
+    const inner = withoutLastLeave(node.namedChildren);
+    const group = groupOf(inner);
+    if (group === "group") return statementList(inner, depth, { ...at, loops: [...at.loops, group] });
     emit(depth, `${group}: {`);
-    statementList(node.namedChildren, depth + 1, { ...at, loops: [...at.loops, group] });
+    statementList(inner, depth + 1, { ...at, loops: [...at.loops, group] });
     emit(depth, "}");
+  };
+
+  /** @param {Node} n */
+  const unlabeledLeave = (n) => n.type === "leave_statement" && !n.namedChildren.some((i) => i?.type === "identifier");
+
+  /**
+   * A DO group's statements without its last one when that is an unlabeled
+   * LEAVE: it ends the group where the group ends anyway.
+   * @param {(Node | null)[]} children
+   */
+  const withoutLastLeave = (children) => {
+    const last = children.filter((c) => c !== null && c.type !== "comment" && c.type !== "end_statement").pop();
+    if (!last || !unlabeledLeave(last)) return children;
+    statements++;
+    return children.filter((c) => c !== last);
   };
 
   /**
    * A DO group's JS block label when an unlabeled LEAVE in it ends it, else
    * "group": PL/I's LEAVE ends the innermost DO, a loop or not.
-   * @param {Node} node a do_statement
+   * @param {(Node | null)[]} children the group's statements
    */
-  const groupOf = (node) => {
-    /** @param {Node} n @returns {boolean} */
-    const leaves = (n) =>
-      n.namedChildren.some((c) => c !== null && c.type !== "do_statement" && ((c.type === "leave_statement" && !c.namedChildren.some((i) => i?.type === "identifier")) || leaves(c)));
-    return leaves(node) ? `group${++groups}` : "group";
+  const groupOf = (children) => {
+    /** @param {(Node | null)[]} list @returns {boolean} */
+    const leaves = (list) => list.some((c) => c !== null && c.type !== "do_statement" && (unlabeledLeave(c) || leaves(c.namedChildren)));
+    return leaves(children) ? `group${++groups}` : "group";
   };
 
   /** @param {Node} node a do_statement @param {number} depth @param {At} at @param {string | null} label */
   const doLoop = (node, depth, at, label) => {
     const spec = node.namedChildren.find((c) => c?.type === "do_specification");
-    const inner = node.namedChildren.filter((c) => c !== null && c.type !== "do_specification");
+    let inner = node.namedChildren.filter((c) => c !== null && c.type !== "do_specification");
     const prefix = label ? `${js(label)}: ` : "";
     /** @param {string} open @param {string} close @param {string} kind */
     const block = (open, close, kind) => {
@@ -1474,7 +1808,8 @@ function programToJs(db, root, indexer, path) {
     };
     if (!spec && label) return block("{", "}", js(label));
     if (!spec) {
-      const group = groupOf(node);
+      inner = /** @type {Node[]} */ (withoutLastLeave(inner));
+      const group = groupOf(inner);
       return block(group === "group" ? "{" : `${group}: {`, "}", group);
     }
     const tokens = spec.children.filter((c) => c !== null);
@@ -1567,10 +1902,13 @@ function programToJs(db, root, indexer, path) {
           return `${subject.code} === ${padded}`;
         });
         emit(depth, `${first ? "if" : "} else if"} (${tests.join(" || ")}) {`);
-        body(action, depth + 1, at);
+        if (action.type === "null_statement") emit(depth + 1, "// nothing to do");
+        else body(action, depth + 1, at);
         first = false;
       } else if (clause.type === "otherwise_clause") {
         const action = clause.namedChildren.find((c) => c !== null && c.type !== "comment");
+        const comments = clause.namedChildren.some((c) => c?.type === "comment");
+        if (!first && (!action || action.type === "null_statement") && !comments) return emit(depth, "}");
         emit(depth, first ? "{" : "} else {");
         if (action) body(action, depth + 1, at);
         emit(depth, "}");
@@ -1647,7 +1985,8 @@ function programToJs(db, root, indexer, path) {
         // STRING(s) = x lays x over the structure's fields as a record.
         const record = recordArea(structure, at);
         if (typeof record === "string") return todoStatement(node, depth, record);
-        emit(depth, `decode(${asString(value)}, ${record.area.code}, ${record.layout});`);
+        if (!record.text) return todoStatement(node, depth, "STRING of something that is no structure");
+        emit(depth, `${record.text.from}(${record.area.code}, ${asString(value)});`);
         continue;
       }
       const target = expr(targetNode, at);
@@ -1677,6 +2016,78 @@ function programToJs(db, root, indexer, path) {
       }
       if (once) emit(depth, "}");
     }
+  };
+
+  /** @param {Node} n */
+  const isProcedure = (n) => n.type === "labeled_statement" && n.namedChildren.some((c) => c?.type === "procedure_statement");
+
+  /**
+   * The statements of a procedure with ENTRYs, split at each ENTRY, each
+   * internal procedure with the one part that calls it. Null when a part
+   * runs on into the next one, a GOTO goes from one part to another, a part
+   * uses a parameter of another ENTRY, or an internal procedure is called
+   * by more than one part, by another internal procedure or has a GOTO.
+   * @param {(Node | null)[]} nodes
+   * @param {{ name: string, id: number, parameters: string[] }} main
+   * @param {{ name: string, id: number, parameters: string[] }[]} entries
+   */
+  const entryRegions = (nodes, main, entries) => {
+    const all = /** @type {Node[]} */ (nodes.filter((n) => n !== null));
+    const internal = all.filter(isProcedure);
+    const real = all.filter((n) => !isProcedure(n));
+    const starts = real.flatMap((n, i) => (n.type === "labeled_statement" && n.namedChildren.some((c) => c?.type === "entry_statement") ? [i] : []));
+    if (starts.length !== entries.length) return null;
+    const regions = [main, ...entries].map((e, k) => ({ ...e, nodes: real.slice(k === 0 ? 0 : starts[k - 1] + 1, k < starts.length ? starts[k] : real.length) }));
+    if (regions.slice(0, -1).some((r) => !endsAway(r.nodes))) return null;
+    const regionOf = (/** @type {Node} */ n) => regions.findIndex((r) => r.nodes.length > 0 && n.startIndex >= r.nodes[0].startIndex && n.endIndex <= r.nodes[r.nodes.length - 1].endIndex);
+    const labels = regions.map((r) => new Set(r.nodes.flatMap((n) => [n, ...n.descendantsOfType("labeled_statement")].flatMap((l) => (l ? labelsOf(l) : [])))));
+    for (const [label, gotos] of gotosTo) {
+      const home = labels.findIndex((l) => l.has(label));
+      if (gotos.some((g) => regionOf(g) !== -1 && regionOf(g) !== home)) return null;
+    }
+    const allParameters = regions.flatMap((r) => r.parameters);
+    const regionWords = regions.map((r) => wordsOf(r.nodes));
+    if (regions.some((r, k) => allParameters.some((p) => !r.parameters.includes(p) && regionWords[k].has(p)))) return null;
+    const internalWords = internal.map((q) => wordsOf([q]));
+    for (const [i, p] of internal.entries()) {
+      const name = labelsOf(p)[0];
+      if (p.descendantsOfType("goto_statement").length || internalWords.some((w, j) => j !== i && w.has(name))) return null;
+      const callers = regions.filter((_, k) => regionWords[k].has(name));
+      if (callers.length > 1) return null;
+      (callers[0] ?? regions[0]).nodes.unshift(p);
+    }
+    return regions;
+  };
+
+  /** The last statement of a list, without its label. @param {(Node | null)[]} nodes */
+  const lastStatement = (nodes) => {
+    const last = [...nodes].reverse().find((n) => n !== null && !["comment", "null_statement", "declare_statement", "end_statement"].includes(n.type) && !isProcedure(n));
+    return last?.type === "labeled_statement" ? last.namedChildren.find((c) => c !== null && c.type !== "statement_prefix") : last;
+  };
+  /** Whether a list of statements never runs past its end: it ends in a RETURN or a GOTO. @param {(Node | null)[]} nodes */
+  const endsAway = (nodes) => ["return_statement", "goto_statement"].includes(lastStatement(nodes)?.type ?? "");
+
+  /** The upper-case words of statements, without declarations and comments. @param {Node[]} nodes */
+  const wordsOf = (nodes) =>
+    new Set(
+      nodes
+        .filter((n) => n.type !== "declare_statement" && n.type !== "comment")
+        .flatMap((n) => n.text.toUpperCase().match(/%?[\p{L}\p{N}_@#$§]+/gu) ?? []),
+    );
+
+  /**
+   * The variables of `candidates` that statements use: by name, by one of
+   * their fields, or as the base of a DEFINED or BASED one they use.
+   * @param {Variable[]} candidates @param {Node[]} nodes
+   */
+  const usedIn = (candidates, nodes) => {
+    const words = wordsOf(nodes);
+    if (words.has("%INCLUDE")) return candidates;
+    /** @param {Variable} v @returns {Variable[]} */
+    const fieldsOf = (v) => (children.get(v.id) ?? []).flatMap((f) => [f, ...fieldsOf(f)]);
+    const used = candidates.filter((v) => [v, ...fieldsOf(v)].some((f) => words.has(f.name.toUpperCase())));
+    const bases = new Set(used.flatMap((v) => (v.base ?? "").toUpperCase().match(/[\p{L}\p{N}_@#$§]+/gu) ?? []));
+    return candidates.filter((v) => used.includes(v) || bases.has(v.name.toUpperCase()));
   };
 
   /**
@@ -1711,7 +2122,7 @@ function programToJs(db, root, indexer, path) {
     });
     const changed = [...new Set([symbol.id, ...entries.map((e) => e.id)].flatMap((id) => changedBy(id).map((p) => js(p.name))))];
     /** @type {At} */
-    const scope = { ...at, scopes: [symbol.id, ...at.scopes], loops: [], changed, gotos: new Map(), units: keepsUnits(node) };
+    const scope = { ...at, scopes: [symbol.id, ...at.scopes], loops: [], changed, alone: returnsAlone(symbol.id), gotos: new Map(), units: keepsUnits(node) };
     const own = variables.filter((v) => v.scope === symbol.id && v.parent === null);
     /** @type {Map<string, Variable>} */
     const params = new Map(
@@ -1727,7 +2138,68 @@ function programToJs(db, root, indexer, path) {
       }
     };
     const exported = depth === 0 ? "export " : "";
-    const guarded = depth === 0 && !/\bRECURSIVE\b/i.test(heading?.text ?? "");
+    // One that calls nothing cannot be called again while it runs.
+    const guarded = depth === 0 && !/\bRECURSIVE\b/i.test(heading?.text ?? "") && Boolean(callsUnder.get(symbol.id));
+    const async = waits(symbol.id) ? "async " : "";
+    /** @type {Set<number>} the STATIC variables already made module variables */
+    const madeStatic = new Set();
+    /**
+     * A function's declarations and statements, after its first line.
+     * @param {(Node | null)[]} nodes @param {string} fname @param {At} fscope @param {Variable[]} declarations @param {boolean} inside whether it guards against being called while it runs
+     */
+    const functionBody = (nodes, fname, fscope, declarations, inside) => {
+      for (const v of declarations) {
+        if (v.storage !== "STATIC" || v.external) {
+          declare(v, depth + 1, fscope, params);
+          continue;
+        }
+        // STATIC keeps its value from one call to the next: a module variable.
+        if (madeStatic.has(v.id)) continue;
+        madeStatic.add(v.id);
+        const mark = lines.length;
+        declare(v, 0, fscope, params);
+        statics.push(...lines.splice(mark));
+      }
+      if (depth === 0 && usesSql && !variableAt("SQLCODE", fscope)) emit(depth + 1, "let SQLCODE = 0;");
+      if (depth === 0 && cursors.size) emit(depth + 1, "/** @type {Record<string, { sqlcode: number, rows: unknown[][], next: number }>} */\n" + "  ".repeat(depth + 1) + "const CURSORS = {};");
+      const wrapped = fscope.units || inside;
+      const inner = wrapped ? depth + 2 : depth + 1;
+      if (inside) emit(depth + 1, `begin(${JSON.stringify(fname)});`);
+      if (fscope.units) emit(depth + 1, "const units = enter();");
+      if (wrapped) emit(depth + 1, "try {");
+      statementList(nodes, inner, fscope);
+      if (fscope.changed.length && !endsAway(nodes)) emit(inner, `return ${changedValue(fscope)};`);
+      if (fscope.units) {
+        emit(depth + 1, "} catch (error) {");
+        emit(depth + 2, "throw await failed(error);");
+      }
+      if (wrapped) {
+        emit(depth + 1, "} finally {");
+        if (fscope.units) emit(depth + 2, "leave(units);");
+        if (inside) emit(depth + 2, `end(${JSON.stringify(fname)});`);
+        emit(depth + 1, "}");
+      }
+      emit(depth, "}");
+    };
+
+    const regions = entries.length && !/\bRETURNS\b/i.test(heading?.text ?? "") ? entryRegions(block?.namedChildren ?? [], { name, id: symbol.id, parameters }, entries) : null;
+    const candidates = [...(depth === 0 ? variables.filter((v) => v.file !== file.id && v.parent === null && v.scope === null) : []), ...own.filter((v) => v.parameter === null)];
+    if (regions) {
+      // Each ENTRY's statements end in a RETURN before the next ENTRY: a function of its own, declaring what it uses.
+      for (const region of regions) {
+        emit(depth, "/**");
+        for (const text of region.name === name ? (comment ?? name).split("\n") : [`ENTRY of ${name}`]) emit(depth, ` * ${text.trim()}`);
+        jsdocParams(region.parameters);
+        emit(depth, " */");
+        emit(depth, `${exported}${async}function ${js(region.name)}(${region.parameters.map(js).join(", ")}) {`);
+        const used = usedIn(
+          candidates.filter((v) => !region.parameters.includes(v.name.toUpperCase())),
+          region.nodes,
+        );
+        functionBody(region.nodes, region.name, { ...scope, changed: changedBy(region.id).map((p) => js(p.name)) }, used, guarded);
+      }
+      return;
+    }
     if (entries.length) {
       // The guard is on the entry point: real programs call their own ENTRY
       // while they run, but not the one they are in.
@@ -1737,8 +2209,8 @@ function programToJs(db, root, indexer, path) {
         for (const text of entry === name ? (comment ?? name).split("\n") : [`ENTRY of ${name}`]) emit(depth, ` * ${text.trim()}`);
         jsdocParams(/** @type {string[]} */ (names));
         emit(depth, " */");
-        emit(depth, `${exported}async function ${js(/** @type {string} */ (entry))}(${list}) {`);
-        const run = `return await ${js(name)}$(${JSON.stringify(entry === name ? "" : entry)}, { ${list} });`;
+        emit(depth, `${exported}${async}function ${js(/** @type {string} */ (entry))}(${list}) {`);
+        const run = `return ${async ? "await " : ""}${js(name)}$(${JSON.stringify(entry === name ? "" : entry)}, { ${list} });`;
         if (guarded) {
           emit(depth + 1, `begin(${JSON.stringify(entry)});`);
           emit(depth + 1, "try {");
@@ -1750,55 +2222,25 @@ function programToJs(db, root, indexer, path) {
         emit(depth, "}");
       }
       emit(depth, `/** ${name} and its entries, from the statement of the one called */`);
-      emit(depth, `async function ${js(name)}$(entry, { ${allParameters.map(js).join(", ")} }) {`);
+      emit(depth, `${async}function ${js(name)}$(entry, { ${allParameters.map(js).join(", ")} }) {`);
     } else {
       emit(depth, "/**");
       for (const text of (comment ?? name).split("\n")) emit(depth, ` * ${text.trim()}`);
       jsdocParams(parameters);
       emit(depth, " */");
-      emit(depth, `${exported}async function ${js(name)}(${parameters.map(js).join(", ")}) {`);
+      emit(depth, `${exported}${async}function ${js(name)}(${parameters.map(js).join(", ")}) {`);
     }
     if (changed.length && heading && /\bRETURNS\b/i.test(heading.text)) {
       todos.push({ path: current.path, line, why: `${name} returns a value and changes its parameters ${changed.join(", ")}` });
       emit(depth + 1, `// TODO: ${name} returns a value, so the changes to ${changed.join(", ")} do not reach the caller.`);
       scope.changed = [];
     }
-    const declarations = [
-      ...(depth === 0 ? variables.filter((v) => v.file !== file.id && v.parent === null && v.scope === null) : []),
-      ...own.filter((v) => v.parameter === null && !allParameters.includes(v.name.toUpperCase())),
-    ];
-    for (const v of declarations) {
-      if (v.storage !== "STATIC" || v.external) {
-        declare(v, depth + 1, scope, params);
-        continue;
-      }
-      // STATIC keeps its value from one call to the next: a module variable.
-      const mark = lines.length;
-      declare(v, 0, scope, params);
-      statics.push(...lines.splice(mark));
-    }
-    if (depth === 0 && usesSql && !variableAt("SQLCODE", scope)) emit(depth + 1, "let SQLCODE = 0;");
-    if (depth === 0 && cursors.size) emit(depth + 1, "/** @type {Record<string, { sqlcode: number, rows: unknown[][], next: number }>} */\n" + "  ".repeat(depth + 1) + "const CURSORS = {};");
+    const declared = candidates.filter((v) => v.scope === null || !allParameters.includes(v.name.toUpperCase()));
+    // An EXTERNAL one's INIT may be what another program reads, and PUT without FILE writes to SYSPRINT.
+    const used = usedIn(declared, /** @type {Node[]} */ ((block?.namedChildren ?? []).filter((n) => n !== null)));
+    const declarations = declared.filter((v) => used.includes(v) || v.external || v.type?.toUpperCase() === "FILE");
     if (entries.length) scope.start = "entry";
-    const inside = guarded && !entries.length;
-    const wrapped = scope.units || inside;
-    const inner = wrapped ? depth + 2 : depth + 1;
-    if (inside) emit(depth + 1, `begin(${JSON.stringify(name)});`);
-    if (scope.units) emit(depth + 1, "const units = enter();");
-    if (wrapped) emit(depth + 1, "try {");
-    statementList(block?.namedChildren ?? [], inner, scope);
-    if (scope.changed.length) emit(inner, `return { ${scope.changed.join(", ")} };`);
-    if (scope.units) {
-      emit(depth + 1, "} catch (error) {");
-      emit(depth + 2, "throw await failed(error);");
-    }
-    if (wrapped) {
-      emit(depth + 1, "} finally {");
-      if (scope.units) emit(depth + 2, "leave(units);");
-      if (inside) emit(depth + 2, `end(${JSON.stringify(name)});`);
-      emit(depth + 1, "}");
-    }
-    emit(depth, "}");
+    functionBody(block?.namedChildren ?? [], name, scope, declarations, guarded && !entries.length);
   };
 
   /** A statement, counted as translated unless it got a TODO. @param {Node} node @param {number} depth @param {At} outer */
@@ -1813,6 +2255,7 @@ function programToJs(db, root, indexer, path) {
     const at = { ...outer, line: lineOf(node) };
     switch (node.type) {
       case "comment":
+        if (node.nextNamedSibling?.type === "declare_statement") return; // the declaration's JSDoc has it
         for (const line of node.text.replace(/^\/\*\s?|\s*\*\/$/g, "").split("\n")) emit(depth, `// ${line.trim()}`);
         return;
       case "declare_statement":
@@ -1846,8 +2289,9 @@ function programToJs(db, root, indexer, path) {
         );
         const include = target && includeTrees.get(target.target_file);
         const code = include?.tree?.rootNode.namedChildren.filter((c) => c && c.type !== "comment" && c.type !== "declare_statement") ?? [];
-        if (!target || !include?.tree || !code.length || expanding.has(target.target_file)) return emit(depth, `// ${text}: its declarations are at the top, from includes/`);
-        emit(depth, `// ${text}: its declarations are at the top, from includes/, its statements here`);
+        // An include of only declarations is the import and the declarations at the top.
+        if (!target || !include?.tree || !code.length || expanding.has(target.target_file)) return;
+        emit(depth, `// ${text}: its statements`);
         const outer = current;
         current = { id: target.target_file, path: include.path };
         expanding.add(target.target_file);
@@ -1879,24 +2323,52 @@ function programToJs(db, root, indexer, path) {
       case "assignment_statement":
         return assignment(node, depth, at);
       case "if_statement": {
-        const consequence = /** @type {Node} */ (node.childForFieldName("consequence"));
-        const alternative = node.childForFieldName("alternative");
-        // A comment between THEN, ELSE and their statements goes with the statement after it.
-        const comments = node.namedChildren.filter((c) => c?.type === "comment");
-        /** @param {number} from @param {number} to @param {number} at */
-        const commentsBetween = (from, to, at) => {
-          for (const c of comments) if (c && c.startIndex >= from && c.startIndex < to) translate(c, at, outer);
-        };
-        emit(depth, `if (${expr(/** @type {Node} */ (node.childForFieldName("condition")), at).code}) {`);
-        commentsBetween(node.startIndex, consequence.startIndex, depth + 1);
-        body(consequence, depth + 1, at);
-        if (alternative) {
+        // ELSE IF chains become one `else if` chain; their trailing comments follow it, innermost first.
+        /** @type {(() => void)[]} */
+        const trailing = [];
+        let level = node;
+        let opener = "if";
+        /** @type {Expr} */
+        let condition = { code: "", kind: "number" };
+        const start = lines.length;
+        for (;;) {
+          const here = { ...outer, line: lineOf(level) };
+          const consequence = /** @type {Node} */ (level.childForFieldName("consequence"));
+          const alternative = level.childForFieldName("alternative");
+          // A comment between THEN, ELSE and their statements goes with the statement after it.
+          const comments = level.namedChildren.filter((c) => c?.type === "comment");
+          /** @param {number} from @param {number} to @param {number} at */
+          const commentsBetween = (from, to, at) => {
+            for (const c of comments) if (c && c.startIndex >= from && c.startIndex < to) translate(c, at, outer);
+          };
+          const commented = (/** @type {number} */ from, /** @type {number} */ to) => comments.some((c) => c && c.startIndex >= from && c.startIndex < to);
+          condition = expr(/** @type {Node} */ (level.childForFieldName("condition")), here);
+          emit(depth, `${opener} (${condition.code}) {`);
+          commentsBetween(level.startIndex, consequence.startIndex, depth + 1);
+          body(consequence, depth + 1, here);
+          const end = (alternative ?? consequence).endIndex;
+          const levelNode = level;
+          trailing.unshift(() => commentsBetween(end, levelNode.endIndex, depth));
+          if (!alternative || (alternative.type === "null_statement" && !commented(consequence.endIndex, alternative.endIndex))) break;
+          if (alternative.type === "if_statement" && !commented(consequence.endIndex, alternative.startIndex)) {
+            if (!failed.has(alternative.id)) statements++;
+            level = alternative;
+            opener = "} else if";
+            continue;
+          }
           emit(depth, "} else {");
           commentsBetween(consequence.endIndex, alternative.startIndex, depth + 1);
-          body(alternative, depth + 1, at);
+          body(alternative, depth + 1, here);
+          break;
         }
         emit(depth, "}");
-        commentsBetween((alternative ?? consequence).endIndex, node.endIndex, depth);
+        // IF C THEN X = '1'B; ELSE X = '0'B; becomes X = C;
+        const set = lines.slice(start).map((l) => l.trim().match(/^(?:if \(.*\) \{|\} else \{|\}|(.+) = (true|false);)$/));
+        if (level === node && condition.kind === "bit" && set.length === 5 && set.every(Boolean) && set[1]?.[1] && set[1][1] === set[3]?.[1] && set[1][2] !== set[3][2]) {
+          lines.splice(start, 5);
+          emit(depth, `${set[1][1]} = ${set[1][2] === "true" ? condition.code : `!(${condition.code})`};`);
+        }
+        for (const comments of trailing) comments();
         return;
       }
       case "do_statement":
@@ -1917,7 +2389,7 @@ function programToJs(db, root, indexer, path) {
       case "return_statement": {
         const value = node.namedChildren.find((c) => c !== null && c.type !== "comment");
         if (value) return emit(depth, `return ${expr(value, at).code};`);
-        return emit(depth, at.changed.length ? `return { ${at.changed.join(", ")} };` : "return;");
+        return emit(depth, at.changed.length ? `return ${changedValue(at)};` : "return;");
       }
       case "call_statement":
         return call(node, depth, at);
@@ -1935,11 +2407,28 @@ function programToJs(db, root, indexer, path) {
       case "goto_statement": {
         const label = node.childForFieldName("label")?.text.toUpperCase() ?? "";
         if (!labels.has(label)) return todoStatement(node, depth, `GOTO ${label}, which is no label`);
-        const dispatcher = at.gotos.get(label);
-        if (!dispatcher) return emit(depth, `throw new GoTo(${JSON.stringify(label)});`);
+        const jump = at.gotos.get(label);
+        if (!jump) return emit(depth, `throw new GoTo(${JSON.stringify(label)});`);
+        if ("block" in jump) return emit(depth, `break ${jump.block};`);
+        if ("loop" in jump) return emit(depth, `continue ${jump.loop};`);
+        if ("returns" in jump) {
+          // R = 110; GOTO RAUS; ... RAUS: RETURN(R); returns 110 when nothing else can see R.
+          const value = jump.returns.namedChildren.find((c) => c !== null && c.type !== "comment");
+          const returned = value ? expr(value, at) : undefined;
+          const v = returned?.v;
+          let before = node.previousNamedSibling;
+          while (before?.type === "comment") before = before.previousNamedSibling;
+          const set = before?.type === "assignment_statement" ? lines.at(-1)?.match(/^\s*(\S+) = (.+);$/) : undefined;
+          const local = v && v.scope === at.scopes[0] && v.parent === null && v.parameter === null && !v.external && v.storage !== "STATIC";
+          if (local && set && set[1] === returned.code) {
+            lines.pop();
+            return emit(depth, `return ${set[2]};`);
+          }
+          return translate(jump.returns, depth, at);
+        }
         emit(depth, "{");
-        emit(depth + 1, `${dispatcher} = ${JSON.stringify(label)};`);
-        emit(depth + 1, `continue ${dispatcher};`);
+        emit(depth + 1, `${jump.dispatcher} = ${JSON.stringify(label)};`);
+        emit(depth + 1, `continue ${jump.dispatcher};`);
         return emit(depth, "}");
       }
       case "on_statement":
@@ -2015,7 +2504,7 @@ function programToJs(db, root, indexer, path) {
 
   for (const node of tree.rootNode.descendantsOfType("exec_statement")) {
     const cursor = node && DECLARE_CURSOR.exec(node.text.replace(/^EXEC\s+SQL\s+/i, ""));
-    if (cursor) cursors.set(cursor[1].toUpperCase(), cursor[2].replace(/\s*\n\s*/g, " "));
+    if (cursor) cursors.set(cursor[1].toUpperCase(), { text: cursor[2].trim(), column: columnOf(node, node.text.indexOf(cursor[2].trim())) });
   }
   /** @type {At} */
   const top = { line: 1, scopes: [], loops: [], changed: [], gotos: new Map(), units: false };
@@ -2024,23 +2513,41 @@ function programToJs(db, root, indexer, path) {
     statement(node, 0, top);
   }
 
+  const code = [...(statics.length ? [...statics, ""] : []), ...lines, ""].join("\n");
+  const usedLayouts = [...layouts].filter(([name]) => new RegExp(`\\b${name.replace(/\$/g, "\\$")}\\(`).test(code) || name.endsWith("_FIELDS"));
+  const moduleBody = [...usedLayouts.flatMap(([, layout]) => [layout, ""]), code].join("\n");
   const header = [
     `// ${file.member}, translated from ${path} by PL/I Graph. TODO marks what is not translated.`,
-    RUNTIME_IMPORT,
+    ...runtimeImport(moduleBody),
     ...[...includes.keys()].map((member) => `import * as ${js(member)} from "../includes/${member}.js";`),
     ...[...imports].map(([name, member]) => `import { ${name} } from "./${member}.js";`),
     ...(dbdsUsed.size ? [`import { ${[...dbdsUsed].map(js).sort().join(", ")} } from "../databases.js";`] : []),
     "",
-    ...[...layouts.values()].flatMap((layout) => [layout, ""]),
-    ...(statics.length ? [...statics, ""] : []),
   ];
-  return { code: [...header, ...lines, ""].join("\n"), statements, todos, calls: [...calls], includes };
+  return { code: [...header, moduleBody].join("\n"), statements, todos, calls: [...calls], includes };
 }
 
-const RUNTIME_IMPORT = `import { array, begin, bin, char, date, datetime, dec, decode, dli, encode, end, enter, EXTERNAL, failed, fetchCursor, GoTo, ims, landing, leave, mod, noWhen, num, oncode, openCursor, overlay, RecordFile, Ref, round, setReturnCode, signal, sql, standardFiles, Stop, Stream, StreamFile, substr, sum, time, todo, toPic, translate, varchar, verify } from "../runtime.js";`;
+/** The statements that translate to plain code, without await. A CALL depends on what it calls. */
+const SYNC_KINDS = new Set(["declare", "if", "do", "select", "when", "otherwise", "assignment", "call", "return", "leave", "iterate", "null", "stop", "goto"]);
+/** What a procedure may call without having to wait. */
+const SYNC_BUILTINS = new Set([...PLI_BUILTINS, "PLIRETC"]);
+
+const RUNTIME_NAMES = ["array", "begin", "bin", "char", "date", "datetime", "dec", "dli", "end", "enter", "EXTERNAL", "failed", "fetchCursor", "fromPic", "GoTo", "ims", "landing", "leave", "mod", "noWhen", "num", "oncode", "openCursor", "overlay", "RecordFile", "Ref", "round", "setReturnCode", "signal", "sql", "standardFiles", "Stop", "Stream", "StreamFile", "substr", "sum", "time", "todo", "toPic", "translate", "varchar", "verify"];
+
+/** The import of only the runtime names the module's code uses, or nothing. @param {string} code */
+function runtimeImport(code) {
+  const used = RUNTIME_NAMES.filter((name) => new RegExp(`(?<![\\w$.])${name.replace("$", "\\$")}(?![\\w$])`).test(code));
+  return used.length ? [`import { ${used.join(", ")} } from "../runtime.js";`] : [];
+}
 
 /**
- * A JCL job as a module that runs its steps with runJob: each DD as a Dd,
+ * A JCL IF around a step: `code` tests it, `otherwise` in its ELSE, `abend`
+ * when it tests ABEND, so its steps run after a failure. `id` tells IFs apart.
+ * @typedef {{ id: string, code: string, abend: boolean, otherwise: boolean }} Frame
+ */
+
+/**
+ * A JCL job as a module that runs its steps one after the other on a Job: each DD as a Dd,
  * each PL/I program the generated one. A step running a JCL procedure runs
  * the procedure's steps, the step's DDs replacing theirs by name (a new one
  * goes to the first). IKJEFT01 runs the program of `RUN PROGRAM` in SYSTSIN.
@@ -2127,7 +2634,7 @@ function jobToJs(db, root, jobId, pathOfMember) {
     return cond;
   };
   /**
-   * A JCL IF condition as JavaScript over runJob's state `s`; null when it
+   * A JCL IF condition as JavaScript over the Job `job`; null when it
    * cannot be read. AND and OR go left to right, as JCL has them.
    * @param {string} text between IF and THEN
    * @param {string} prefix put before step names: `PSTEP.` in a procedure
@@ -2152,7 +2659,7 @@ function jobToJs(db, root, jobId, pathOfMember) {
       const m = /^(?:(.+)\.)?(RC|ABEND|RUN)$/.exec(t);
       if (!m || (m[2] === "RUN" && !m[1])) return null;
       if (m[2] === "ABEND") abend = true;
-      return `s.${{ RC: "rc", ABEND: "abend", RUN: "ran" }[m[2]]}(${m[1] ? JSON.stringify(prefix + m[1]) : ""})`;
+      return `job.${{ RC: "rc", ABEND: "abend", RUN: "ran" }[m[2]]}(${m[1] ? JSON.stringify(prefix + m[1]) : ""})`;
     };
     /** @returns {string | null} */
     const unary = () => {
@@ -2189,15 +2696,15 @@ function jobToJs(db, root, jobId, pathOfMember) {
     return code && i === tokens.length ? { code, abend } : null;
   };
   /**
-   * The IFs each EXEC line is under, from the line after `from` (a JOB or
-   * PROC) to the next JOB, PROC or PEND.
+   * The IFs each EXEC line is under, outermost first, from the line after
+   * `from` (a JOB or PROC) to the next JOB, PROC or PEND.
    * @param {string} path @param {number} from @param {string} prefix see ifOf
-   * @returns {Map<number, { when: string, afterAbend: boolean }>}
+   * @returns {Map<number, Frame[]>}
    */
   const guardsOf = (path, from, prefix) => {
     const guards = new Map();
     const lines = linesOf(path);
-    /** @type {{ code: string, abend: boolean, otherwise: boolean }[]} */
+    /** @type {Frame[]} */
     const open = [];
     for (let i = from; i < lines.length; i++) {
       if (lines[i].startsWith("//*")) continue;
@@ -2214,12 +2721,10 @@ function jobToJs(db, root, jobId, pathOfMember) {
         const condition = /^(.*?)\bTHEN\b/is.exec(text);
         const parsed = condition && ifOf(condition[1], prefix);
         if (!parsed) todos.push({ line: i + 1, why: `the IF${text.replace(/\s+/g, " ")}: a condition the generator does not read, so it counts as true` });
-        open.push({ ...(parsed ?? { code: "true", abend: false }), otherwise: false });
-      } else if (op === "ELSE" && open.length) open[open.length - 1].otherwise = true;
+        open.push({ id: `${prefix}${path}:${i + 1}`, ...(parsed ?? { code: "true", abend: false }), otherwise: false });
+      } else if (op === "ELSE" && open.length) open[open.length - 1] = { ...open[open.length - 1], otherwise: true };
       else if (op === "ENDIF") open.pop();
-      else if (op === "EXEC" && open.length) {
-        guards.set(i + 1, { when: open.map((o) => (o.otherwise ? `!(${o.code})` : o.code)).join(" && "), afterAbend: open.some((o) => o.abend) });
-      }
+      else if (op === "EXEC") guards.set(i + 1, [...open]);
     }
     return guards;
   };
@@ -2310,15 +2815,15 @@ function jobToJs(db, root, jobId, pathOfMember) {
     todos.push({ line, why: `the step ${where}: ${cond}, a COND the generator does not read` });
     return undefined;
   };
-  /** @type {{ step: string, program: string, parm: string | null, dds: Map<string, object>, line: number, cond?: object, when?: string, afterAbend?: boolean, procedure?: string, procedureWhen?: string }[]} */
+  /** @type {{ step: string, program: string, parm: string | null, dds: Map<string, object>, line: number, cond?: { tests: (string | number)[][], even?: true, only?: true }, frames: Frame[] }[]} */
   const steps = [];
   for (const step of stepsOf(jobId)) {
     const name = step.name ?? `STEP${steps.length + 1}`;
     const values = setBefore(step.line);
     const own = ddMap(ddsOf(step.id), name, values);
     const operands = operandsAt(step.path, step.line);
-    const guard = guards.get(step.line);
-    const outer = { ...guard, cond: readable(condOf(operands, "COND"), step.line, name) };
+    const frames = guards.get(step.line) ?? [];
+    const cond = readable(condOf(operands, "COND"), step.line, name);
     if (step.program || !step.procedure) {
       let program = step.program ?? "";
       let parm = step.parm && resolve(step.parm, values, step.line, `the PARM of ${name}`);
@@ -2330,7 +2835,7 @@ function jobToJs(db, root, jobId, pathOfMember) {
           parm = run[2] ?? null;
         }
       }
-      steps.push({ step: name, program, parm, dds: own, line: step.line, ...outer });
+      steps.push({ step: name, program, parm, dds: own, line: step.line, cond, frames });
       continue;
     }
     const procedure = /** @type {{ id: number, path: string, line: number } | undefined} */ (
@@ -2352,39 +2857,74 @@ function jobToJs(db, root, jobId, pathOfMember) {
       const dds = ddMap(ddsOf(p.id), where, symbols);
       for (const [dd, value] of own) if (dds.has(dd) || i === 0) dds.set(dd, value);
       const procCond = readable(condOf(operandsAt(p.path, p.line), "COND"), p.line, where);
-      const cond = readable(condOf(operands, `COND.${p.name}`), step.line, where) ?? outer.cond ?? (procCond && { ...procCond, tests: procCond.tests.map(([code, op, step]) => [code, op, ...(step === undefined ? [] : [String(step).includes(".") ? step : `${name}.${step}`])]) });
+      const stepCond = readable(condOf(operands, `COND.${p.name}`), step.line, where) ?? cond ?? (procCond && { ...procCond, tests: procCond.tests.map(([code, op, step]) => [code, op, ...(step === undefined ? [] : [String(step).includes(".") ? step : `${name}.${step}`])]) });
       const parm = p.parm && resolve(p.parm, symbols, p.line, `the PARM of ${where}`);
-      const guard = innerGuards.get(p.line);
-      const afterAbend = outer.afterAbend || guard?.afterAbend || undefined;
-      steps.push({ step: where, program: p.program ?? "", parm, dds, line: step.line, cond, when: guard?.when, afterAbend, procedure: name, procedureWhen: outer.when });
+      steps.push({ step: where, program: p.program ?? "", parm, dds, line: step.line, cond: stepCond, frames: [...frames, ...(innerGuards.get(p.line) ?? [])] });
     });
   }
 
   const lines = [`// ${job.name}, the job in ${job.path}, generated by PL/I Graph: \`node jobs/${job.name}.js\` runs its steps.`];
-  lines.push(`import { pathToFileURL } from "node:url";`, `import { runJob } from "../runtime.js";`);
+  lines.push(`import { pathToFileURL } from "node:url";`, `import { Job } from "../runtime.js";`);
   for (const step of steps) {
     const path = pathOfMember(step.program);
     if (path) programs.set(step.program, path);
     else if (step.program !== "IEFBR14") todos.push({ line: step.line, why: `the step ${step.step}: ${step.program || "its program"} is no PL/I program in the graph` });
   }
   for (const member of programs.keys()) lines.push(`import { ${js(member)} } from "../programs/${member}.js";`);
+
+  /** @type {Record<string, string>} COND's operators, `code op rc` */
+  const COND_OPS = { GT: ">", GE: ">=", EQ: "===", LT: "<", LE: "<=", NE: "!==" };
+  /** COND tests as one JavaScript condition, true when the step is bypassed. @param {(string | number)[][]} tests */
+  const bypassed = (tests) =>
+    tests.map(([code, op, step]) => `job.codes(${step === undefined ? "" : JSON.stringify(step)}).some((rc) => ${code} ${COND_OPS[op]} rc)`).join(" || ");
+  /** @param {string} key */
+  const property = (key) => (/^[A-Za-z_$][\w$]*$/.test(key) ? key : JSON.stringify(key));
   const jobCond = readable(condOf(operandsAt(job.path, job.line), "COND"), job.line, job.name);
-  lines.push("", `/** Runs ${job.name}'s steps in order. @returns {Promise<number>} the highest return code */`, `export async function ${js(job.name)}() {`, `  return runJob(${JSON.stringify(job.name)}, [`);
+
+  lines.push("", `/** Runs ${job.name}'s steps in order. @returns {Promise<number>} the highest return code */`, `export async function ${js(job.name)}() {`, `  const job = new Job(${JSON.stringify(job.name)});`);
+  /** @type {Frame[]} the IFs open in the code */
+  let open = [];
   for (const step of steps) {
-    lines.push(`    {`);
-    lines.push(`      step: ${JSON.stringify(step.step)},`);
-    lines.push(`      program: ${JSON.stringify(step.program)},`);
-    lines.push(`      run: ${programs.has(step.program) ? js(step.program) : "null"},`);
-    lines.push(`      parm: ${JSON.stringify(step.parm)},`);
-    if (step.cond) lines.push(`      cond: ${JSON.stringify(step.cond)},`);
-    if (step.when) lines.push(`      when: (s) => ${step.when},`);
-    if (step.afterAbend) lines.push(`      afterAbend: true,`);
-    if (step.procedureWhen) lines.push(`      procedure: ${JSON.stringify(step.procedure)},`, `      procedureWhen: (s) => ${step.procedureWhen},`);
-    lines.push(`      dds: {`);
-    for (const [name, dd] of step.dds) lines.push(`        ${JSON.stringify(name)}: ${JSON.stringify(dd)},`);
-    lines.push(`      },`, `    },`);
+    let same = 0;
+    while (same < open.length && same < step.frames.length && open[same].id === step.frames[same].id && open[same].otherwise === step.frames[same].otherwise) same++;
+    const toElse = same < open.length && same < step.frames.length && open[same].id === step.frames[same].id;
+    while (open.length > same + (toElse ? 1 : 0)) {
+      open.pop();
+      lines.push(`${"  ".repeat(open.length + 1)}}`);
+    }
+    if (toElse) {
+      lines.push(`${"  ".repeat(same + 1)}} else {`);
+      open[same] = step.frames[same];
+      same++;
+    }
+    for (const frame of step.frames.slice(same)) {
+      lines.push(`${"  ".repeat(open.length + 1)}if (${frame.otherwise ? `!(${frame.code})` : frame.code}) {`);
+      open.push(frame);
+    }
+
+    const indent = "  ".repeat(open.length + 1);
+    const afterAbend = step.cond?.even || step.frames.some((f) => f.abend);
+    const tests = step.cond?.tests ?? [];
+    const runs = [
+      ...(step.cond?.only ? ["job.abended"] : afterAbend || step === steps[0] ? [] : ["!job.abended"]),
+      ...(tests.length === 1 ? [`!${bypassed(tests)}`] : tests.length ? [`!(${bypassed(tests)})`] : []),
+    ];
+    const program = programs.has(step.program) ? js(step.program) : JSON.stringify(step.program);
+    const call = [
+      `await job.step(${JSON.stringify(step.step)}, ${program}, {`,
+      ...[...step.dds].map(([name, dd]) => `  ${property(name)}: { ${Object.entries(dd).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(", ")} },`),
+      `}${step.parm === null ? "" : `, ${JSON.stringify(step.parm)}`});`,
+      ...(jobCond?.tests.length ? [`if (${bypassed(jobCond.tests)}) return job.end();`] : []),
+    ];
+    if (runs.length) {
+      lines.push(`${indent}if (${runs.join(" && ")}) {`, ...call.map((l) => `${indent}  ${l}`), `${indent}}`);
+    } else lines.push(...call.map((l) => `${indent}${l}`));
   }
-  lines.push(jobCond ? `  ], ${JSON.stringify(jobCond.tests)});` : `  ]);`, `}`, "");
+  while (open.length) {
+    open.pop();
+    lines.push(`${"  ".repeat(open.length + 1)}}`);
+  }
+  lines.push(`  return job.end();`, `}`, "");
   for (const todo of todos) lines.push(`// TODO: ${todo.why}, line ${todo.line}`);
   lines.push(`if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) process.exitCode = await ${js(job.name)}();`, "");
   return { name: job.name, path: job.path, code: lines.join("\n"), todos, programs: [...programs.values()] };
@@ -2657,17 +3197,35 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
   /**
    * The program of a transaction an input screen sends: the member named like
    * its code, else the one only its third character, the type letter of
-   * member names, tells apart, as AES00400 of AEK00400.
+   * member names, tells apart, as AES00400 of AEK00400. Subprograms named
+   * alike, as AEU00400, are no main procedure or are called by others.
    * @param {string} code
    */
   const programOf = (code) => {
     if (pathOfMember(code)) return code;
     if (code.length < 4) return undefined;
-    const alike = /** @type {{ member: string }[]} */ (
-      db.prepare(`SELECT DISTINCT member FROM files WHERE language = 'pli' AND member LIKE ? AND member <> ?`).all(`${code.slice(0, 2)}_${code.slice(3)}`, code)
+    const alike = /** @type {{ member: string, main: number, called: number }[]} */ (
+      db
+        .prepare(
+          `SELECT f.member,
+             max(EXISTS (SELECT 1 FROM symbols s WHERE s.file = f.id AND s.kind = 'procedure' AND s.parent IS NULL AND s.detail LIKE '%OPTIONS%MAIN%')) AS main,
+             EXISTS (SELECT 1 FROM refs r WHERE r.name = f.member AND r.kind IN ('call', 'fetch')) AS called
+           FROM files f WHERE f.language = 'pli' AND f.member LIKE ? AND f.member <> ? GROUP BY f.member ORDER BY f.member`,
+        )
+        .all(`${code.slice(0, 2)}_${code.slice(3)}`, code)
     );
-    if (alike.length > 1) progress(`transaction ${code}: several programs differ from it only in the third character, ${alike.map((a) => a.member).join(", ")}; it is left out`);
-    return alike.length === 1 ? alike[0].member : undefined;
+    const mains = alike.filter((a) => a.main);
+    const narrowed = mains.length ? mains : alike;
+    const uncalled = narrowed.filter((a) => !a.called);
+    const candidates = uncalled.length ? uncalled : narrowed;
+    if (alike.length > 1) {
+      progress(
+        `transaction ${code}: ${alike.map((a) => `${a.member}${a.main ? " (main)" : ""}${a.called ? " (called)" : ""}`).join(", ")} differ from it only in the third character; ${
+          candidates.length === 1 ? `using ${candidates[0].member}` : "it is left out"
+        }`,
+      );
+    }
+    return candidates.length === 1 ? candidates[0].member : undefined;
   };
   // Without a system definition in the repo, the code an input screen sends is the transaction.
   const codesOnScreens = [...new Set(inputs.map((i) => i.code))];
@@ -2702,6 +3260,29 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
       `[PLG087W] no IMS transactions: no TRANSACT in a system definition, and no MFS input message starts with a literal naming a PL/I program, or one differing from it only in the third character${named}`,
     );
   }
+  // A message program, reading its input with GU on the I/O PCB, that no transaction runs is called through IMS Connect, without a
+  // screen. Its code is not in the repo: it is the program's name with the third character the screen transactions' codes mostly
+  // have where their program's differs (AEK00700 for AES00700), else the program's name.
+  const running = new Set(transactions.map((t) => t.program));
+  const services = /** @type {{ member: string }[]} */ (
+    jobs || paths
+      ? []
+      : db.prepare(`SELECT DISTINCT f.member FROM dli_calls d JOIN files f ON f.id = d.file WHERE d.function = 'GU' AND d.pcb_parameter = 1 AND f.language = 'pli' ORDER BY f.member`).all()
+  ).filter((s) => !running.has(s.member));
+  /** @type {Map<string, number>} */
+  const letters = new Map();
+  for (const t of fromScreens) if (t.code !== t.program) letters.set(t.code[2], (letters.get(t.code[2]) ?? 0) + 1);
+  const letter = [...letters].sort((a, b) => b[1] - a[1])[0]?.[0];
+  const codes = new Set(transactions.map((t) => t.code));
+  for (const s of services) {
+    const named = letter && s.member.length > 3 ? `${s.member.slice(0, 2)}${letter}${s.member.slice(3)}` : s.member;
+    const code = codes.has(named) ? s.member : named;
+    if (codes.has(code)) continue;
+    codes.add(code);
+    transactions.push({ code, program: s.member });
+    progress(`${s.member} reads messages but no screen reaches it: generated as the IMS Connect service ${code}`);
+  }
+  transactions.sort((a, b) => a.code.localeCompare(b.code));
   /** @type {{ code: string, program: string, why: string }[]} */
   const skipped = [];
   /** @type {string[]} */
@@ -2770,8 +3351,8 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     writeFileSync(
       join(outDir, "includes", `${include}.js`),
       [
-        `// The declarations of the include ${include}, translated by PL/I Graph: each function returns a new variable with its initial value.`,
-        RUNTIME_IMPORT,
+        `// The declarations of the include ${include}, translated by PL/I Graph: its constants, a function per variable returning a new one with its initial value, and how its records are read from and written as text.`,
+        ...runtimeImport([...factories.values()].join("\n")),
         ...[...factories.values()].flatMap((code) => ["", code]),
         "",
       ].join("\n"),
@@ -2879,5 +3460,80 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     `${JSON.stringify({ name: "pli-generated", private: true, type: "module", scripts: { start: "node server.js" }, dependencies: { ibm_db: "^3.2.4" } }, null, 2)}\n`,
   );
   progress(`wrote ${programs.length} programs, ${generated.length} transactions and ${batch.length} jobs to ${outDir}`);
-  return { programs, transactions: generated.map((t) => t.code), skipped, failures, jobs: batch.map((j) => ({ name: j.name, path: j.path, module: `jobs/${j.name}.js`, todos: j.todos })) };
+
+  const translatedPaths = JSON.stringify(programs.map((p) => p.path));
+  const pliFiles = /** @type {{ path: string, member: string, used: number, included: number }[]} */ (
+    db
+      .prepare(
+        `WITH RECURSIVE inc(id) AS (
+           SELECT l.target_file FROM refs r JOIN links l ON l.ref = r.id JOIN files f ON f.id = r.file WHERE r.kind = 'include' AND f.path IN (SELECT value FROM json_each(?))
+           UNION SELECT l.target_file FROM inc JOIN refs r ON r.file = inc.id AND r.kind = 'include' JOIN links l ON l.ref = r.id)
+         SELECT f.path, f.member, f.id IN (SELECT id FROM inc) AS used,
+           EXISTS (SELECT 1 FROM links l JOIN refs r ON r.id = l.ref AND r.kind = 'include' WHERE l.target_file = f.id) AS included
+         FROM files f WHERE f.language = 'pli' ORDER BY f.path`,
+      )
+      .all(translatedPaths)
+  );
+  /** @type {{ path: string, why: string }[]} */
+  const untranslated = [];
+  const translatedFrom = new Map(programs.map((p) => [p.member, p.path]));
+  const failed = new Set(failures.map((x) => x.path));
+  for (const f of pliFiles) {
+    if (f.used || translatedFrom.get(f.member) === f.path) continue;
+    const twin = translatedFrom.has(f.member) ? { path: translatedFrom.get(f.member) } : undefined;
+    const why = failed.has(f.path)
+      ? "translating it failed"
+      : twin
+        ? `a copy of ${f.member}, translated from ${twin.path}`
+        : f.included
+          ? "an include no translated program includes"
+          : "no transaction, job or translated program reaches it";
+    untranslated.push({ path: f.path, why });
+  }
+  progress(`${untranslated.length} of ${pliFiles.length} PL/I files are not translated${untranslated.length ? ":" : ""}`);
+  for (const u of untranslated) progress(`  ${u.path}: ${u.why}`);
+
+  // TODO.md: every TODO once, even when an include puts it in many programs, with the code around it.
+  const TODO_CONTEXT = 3;
+  /** @type {Map<string, { path: string, language: string, line: number, end: number, why: string, users: Set<string> }>} */
+  const allTodos = new Map();
+  const owners = [
+    ...programs.map((p) => ({ name: p.member, path: p.path, language: "pli", todos: p.todos })),
+    ...batch.map((j) => ({ name: j.name, path: j.path, language: "jcl", todos: j.todos })),
+  ];
+  for (const owner of owners) {
+    for (const t of owner.todos) {
+      const path = t.path ?? owner.path;
+      const key = `${path}:${t.line}:${t.why}`;
+      const known = allTodos.get(key) ?? { path, language: owner.language, line: t.line, end: t.end ?? t.line, why: t.why, users: new Set() };
+      if (path !== owner.path) known.users.add(owner.name);
+      allTodos.set(key, known);
+    }
+  }
+  const sortedTodos = [...allTodos.values()].sort((a, b) => a.path.localeCompare(b.path) || a.line - b.line);
+  /** @type {Map<string, string[]>} */
+  const sourceLines = new Map();
+  const todoText = [
+    "# TODOs of the generated JavaScript",
+    "",
+    `${sortedTodos.length} TODOs in ${new Set(sortedTodos.map((t) => t.path)).size} files. Each shows the code the generator could not translate, marked with \`>\`, and ${TODO_CONTEXT} lines around it.`,
+    "",
+  ];
+  for (const t of sortedTodos) {
+    if (!sourceLines.has(t.path)) sourceLines.set(t.path, readFileSync(join(root, t.path), "utf-8").replace(/\r?\n$/, "").split(/\r?\n/));
+    const lines = /** @type {string[]} */ (sourceLines.get(t.path));
+    todoText.push(`### ${t.path}:${t.line}: ${t.why}`, "");
+    if (t.users.size) todoText.push(`in ${[...t.users].sort().join(", ")}`, "");
+    todoText.push(`\`\`\`${t.language}`);
+    const first = Math.max(1, t.line - TODO_CONTEXT);
+    const last = Math.min(lines.length, t.end + TODO_CONTEXT);
+    for (let n = first; n <= last; n++) {
+      const mark = n >= t.line && n <= t.end ? ">" : " ";
+      todoText.push(`${mark}${String(n).padStart(4)} ${lines[n - 1]}`.trimEnd());
+    }
+    todoText.push("```", "");
+  }
+  writeFileSync(join(outDir, "TODO.md"), todoText.join("\n"));
+  progress(`wrote ${sortedTodos.length} TODOs to ${join(outDir, "TODO.md")}`);
+  return { programs, transactions: generated.map((t) => t.code), skipped, failures, untranslated, jobs: batch.map((j) => ({ name: j.name, path: j.path, module: `jobs/${j.name}.js`, todos: j.todos })) };
 }

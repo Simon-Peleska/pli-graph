@@ -174,6 +174,7 @@ export function activate(context) {
       const items = [
         { label: "$(type-hierarchy) Show Graph", run: () => vscode.commands.executeCommand("pliGraph.show") },
         { label: "$(checklist) Coverage Report", detail: "What the grammars could not read and which names resolve to nothing.", run: () => vscode.commands.executeCommand("pliGraph.coverage") },
+        { label: "$(tasklist) Show TODOs", detail: "What Generate JavaScript could not translate, with the code around it.", run: () => vscode.commands.executeCommand("pliGraph.showTodos") },
         { label: "$(output) Show Log", run: () => log.show() },
         { label: "$(refresh) Rebuild Graph", detail: "Reads every file again, which takes minutes on a large repository.", run: () => vscode.commands.executeCommand("pliGraph.rebuild") },
       ];
@@ -197,6 +198,7 @@ export function activate(context) {
     vscode.commands.registerCommand("pliGraph.columnPath", () => showColumnPath(context)),
     vscode.commands.registerCommand("pliGraph.coverage", () => showCoverage(context)),
     vscode.commands.registerCommand("pliGraph.generateJs", () => generateJavaScript(context)),
+    vscode.commands.registerCommand("pliGraph.showTodos", showTodos),
     vscode.commands.registerCommand("pliGraph.showScreen", (/** @type {vscode.Uri | undefined} */ uri) => showScreen(context, uri)),
     vscode.commands.registerCommand("pliGraph.tab", pliTab),
     registerMcpServer(context),
@@ -1613,7 +1615,7 @@ async function generateJavaScript(context) {
     );
     const todos = result.programs.reduce((sum, p) => sum + p.todos.length, 0);
     log.info(
-      `generated ${result.programs.length} programs with ${todos} TODOs and ${result.jobs.length} jobs in ${Date.now() - started} ms; ${result.skipped.length} transactions left out, ${result.failures.length} programs failed`,
+      `generated ${result.programs.length} programs with ${todos} TODOs and ${result.jobs.length} jobs in ${Date.now() - started} ms; ${result.skipped.length} transactions left out, ${result.failures.length} programs failed, ${result.untranslated.length} PL/I files not translated`,
     );
     const lines = [
       `# JavaScript generated from ${name}`,
@@ -1627,11 +1629,12 @@ async function generateJavaScript(context) {
       ...(result.failures.length
         ? ["## Programs that failed to translate", "", ...result.failures.flatMap((f) => [`- ${f.path}:`, "", "  ```", ...f.error.split("\n").map((l) => `  ${l}`), "  ```"]), ""]
         : []),
+      `Every TODO, once and with the code around it, is in \`${join(outDir, "TODO.md")}\`: **PL/I Graph: Show TODOs** opens it.`,
+      "",
       "| Program | Statements translated | TODOs |",
       "| --- | ---: | ---: |",
       ...result.programs.map((p) => `| ${p.member} | ${p.statements} | ${p.todos.length} |`),
       "",
-      ...result.programs.flatMap((p) => (p.todos.length ? [`## ${p.member}`, "", ...p.todos.map((t) => `- ${t.path ?? p.path}:${t.line} ${t.why}`), ""] : [])),
       ...(result.jobs.length
         ? [
             "## Batch jobs",
@@ -1642,9 +1645,9 @@ async function generateJavaScript(context) {
             "| --- | ---: |",
             ...result.jobs.map((j) => `| ${j.name} | ${j.todos.length} |`),
             "",
-            ...result.jobs.flatMap((j) => (j.todos.length ? [`### ${j.name}`, "", ...j.todos.map((t) => `- ${j.path}:${t.line} ${t.why}`), ""] : [])),
           ]
         : []),
+      ...(result.untranslated.length ? ["## PL/I files not translated", "", ...result.untranslated.map((u) => `- ${u.path}: ${u.why}`), ""] : []),
     ];
     const opened = await vscode.workspace.openTextDocument({ language: "markdown", content: lines.join("\n") });
     await vscode.window.showTextDocument(opened, { viewColumn: vscode.ViewColumn.Active });
@@ -1655,6 +1658,21 @@ async function generateJavaScript(context) {
   } finally {
     void worker.terminate();
   }
+}
+
+/** Opens generated/JS/TODO.md of the workspace, which Generate JavaScript wrote. */
+async function showTodos() {
+  const document = vscode.window.activeTextEditor?.document;
+  const workspace = (document && locate(document.uri)?.workspace) ?? [...workspaces.values()][0];
+  const file = workspace && join(workspace.folder.uri.fsPath, GENERATED, "JS", "TODO.md");
+  if (!file || !existsSync(file)) {
+    const message = `[PLG089E] There is no ${file ?? "TODO.md"} yet: run PL/I Graph: Generate JavaScript first.`;
+    log.error(message);
+    void vscode.window.showErrorMessage(message);
+    return;
+  }
+  log.info(`showing ${file}`);
+  await vscode.commands.executeCommand("markdown.showPreview", vscode.Uri.file(file));
 }
 
 /** @type {string | undefined} */

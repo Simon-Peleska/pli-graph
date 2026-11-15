@@ -266,7 +266,21 @@ extension keeps of each workspace folder:
   `tn3270/`, the same one *Show 3270 Screen* draws) at
   `http://localhost:8080/<CODE>`. Enter, a PF or a PA key sends the input
   message, runs the program and shows the screen of its reply; Clear blanks
-  the screen (`npm install && node server.js`, `PORT` defaults to 8080). With
+  the screen (`npm install && node server.js`, `PORT` defaults to 8080).
+  Without a system definition, a transaction is the code an MFS input
+  message starts with (see `PLG087W`). A message program, one reading its
+  input with `GU` on the I/O PCB, that no transaction runs is called through
+  IMS Connect. Its code is the program's name with the third character
+  the screen transactions' codes mostly have where their program differs
+  (`AEK00700` for `AES00700`, learned from `AEK00400` running `AES00400`),
+  else the program's name; `POST /<CODE>` with `{"message": "..."}` runs it
+  on that input message
+  and answers `{"reply": [...]}`, the segments it inserted. The summary
+  and the log end with every PL/I file not translated and why.
+  `TODO.md` lists every TODO once, sorted by file and line, even when an
+  include puts it into many programs (it names them): the code the
+  generator could not translate, marked with `>`, and 3 lines around it.
+  **PL/I Graph: Show TODOs**, also in the status bar menu, opens it. With
   `SQLITE=<file>` (`SQLITE=data.db node server.js`, or before a job) the
   SQL runs on that SQLite file instead, no `ibm_db` needed: on first use it
   creates the tables from `sqlite.sql` (every Db2 table of the graph, with
@@ -826,10 +840,14 @@ so on them only the silent gaps apply.
   Without a system definition, a screen whose input message's first `MFLD`
   is `'AEK00400'` makes `AEK00400` a transaction, run by the PL/I program
   `AEK00400`, or else by the one program that differs from it only in the
-  third character, the member type, such as `AES00400`.
+  third character, the member type, such as `AES00400`. Of several such
+  members, subprograms like `AEU00400` drop out: those without
+  `OPTIONS(MAIN)`, then those other programs call.
 - `PLG088W` Generate JavaScript: an MFS input message sends a transaction
   code, but no PL/I program is named like it or differs from it only in the
   third character; the transaction is left out.
+- `PLG089E` Show TODOs: there is no `generated/JS/TODO.md` yet; run
+  Generate JavaScript first.
 
 The graph page's own codes: `VIZ-101` the id in the URL is not in the graph,
 `VIZ-102` a view could not be drawn, `VIZ-103` the details, `VIZ-104` the

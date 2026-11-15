@@ -236,6 +236,12 @@
         "icon": "$(file-code)"
       },
       {
+        "command": "pliGraph.showTodos",
+        "title": "Show TODOs",
+        "category": "PL/I Graph",
+        "icon": "$(tasklist)"
+      },
+      {
         "command": "pliGraph.menu",
         "title": "Menu",
         "category": "PL/I Graph"

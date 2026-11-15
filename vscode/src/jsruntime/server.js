@@ -1,6 +1,8 @@
 // Runs the generated IMS transactions from their MFS screens on tn3270's terminal (terminal.js):
 // GET /<code> shows the input screen, POST /<code> with { aid, values } builds the input message
-// from the typed fields, runs the program, and answers with the screen of its reply as JSON.
+// from the typed fields, runs the program, and answers with the screen of its reply as JSON. A
+// transaction without a screen, called through IMS Connect, takes POST /<code> with { message }
+// and answers { reply }, the segments its program inserted.
 // `node server.js` listens on PORT, 8080 by default.
 
 import { readFileSync } from "node:fs";
@@ -20,10 +22,11 @@ const escape = (text) => String(text).replace(/[&<>"']/g, (c) => `&#${c.charCode
  *   fields: { name: string, row: number, col: number, width: number, protected: boolean, hidden: boolean }[] }} Format
  * @typedef {{ formats: Record<string, Format>, messages: Record<string, Message> }} Screens
  * @typedef {{ code: string, format: Format, values: Record<string, string>, error: string }} Shown what the terminal shows
+ * @typedef {{ code: string, reply: string[], error: string }} Answered what an IMS Connect service sends back: the segments its program inserted
  * @typedef {{ status: number, type: string, body: string }} Reply
  */
 
-/** @param {number} status @param {Shown} shown @returns {Reply} */
+/** @param {number} status @param {Shown | Answered} shown @returns {Reply} */
 const json = (status, shown) => ({ status, type: "application/json", body: JSON.stringify(shown) });
 
 /** @param {number} status @param {string} html @returns {Reply} */
@@ -40,10 +43,41 @@ const terminalPage = (shown) =>
 <script type="module" src="/terminal.js"></script>`,
   );
 
+/** The transaction running now. They take turns, as in one IMS message region, because the runtime's state is global: ON units, open files, the programs running. */
+let region = Promise.resolve("");
+
+/**
+ * Runs a transaction's program on `pcb` after the one running now; the error to show, or "" when it ran or ended with STOP.
+ * @param {string} code
+ * @param {{ program: () => Promise<any>, entry: string }} transaction
+ * @param {{ input: string, output: string[] }} pcb
+ * @returns {Promise<string>}
+ */
+function run(code, transaction, pcb) {
+  region = region.then(() => runAlone(code, transaction, pcb));
+  return region;
+}
+
+/** @param {string} code @param {{ program: () => Promise<any>, entry: string }} transaction @param {{ input: string, output: string[] }} pcb */
+async function runAlone(code, transaction, pcb) {
+  try {
+    const program = await transaction.program();
+    await program[transaction.entry](pcb);
+  } catch (error) {
+    if (!(error instanceof Error && error.name === "Stop")) {
+      console.error(`[PLG057E] ${code} failed:\n`, error);
+      return `[PLG057E] ${code} failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    console.log(`${code} ended with STOP`);
+  }
+  console.log(`${code} replied: ${JSON.stringify(pcb.output)}`);
+  return "";
+}
+
 /**
  * @param {string} method
  * @param {string} path
- * @param {{ aid?: string, values?: Record<string, string> }} [request] what the terminal sent
+ * @param {{ aid?: string, values?: Record<string, string>, message?: string }} [request] what the terminal sent, or the raw input message of a service
  * @returns {Promise<Reply>}
  */
 export async function handle(method, path, request = {}) {
@@ -60,9 +94,17 @@ export async function handle(method, path, request = {}) {
     console.error(`[PLG055E] No transaction ${code}`);
     return html(404, `<p>[PLG055E] No transaction ${escape(code)}</p>`);
   }
-  const input = transaction.screens && transaction.input ? transaction.screens.messages[transaction.input] : undefined;
+  if (!transaction.screens) {
+    // An IMS Connect service: the client sends the input message as it is and gets the inserted segments back.
+    if (method !== "POST") return html(405, `<p>${escape(code)} has no screen: POST {"message": "..."} as JSON to run it</p>`);
+    const pcb = { input: request.message ?? "", output: /** @type {string[]} */ ([]), LTERM: "TERM0001", STATUS: "  " };
+    console.log(`${code} service: ${JSON.stringify(pcb.input)}`);
+    const error = await run(code, transaction, pcb);
+    return json(error ? 500 : 200, { code, reply: pcb.output, error });
+  }
+  const input = transaction.input ? transaction.screens.messages[transaction.input] : undefined;
   const format = input?.format ? transaction.screens?.formats[input.format] : undefined;
-  if (!transaction.screens || !input || !format) {
+  if (!input || !format) {
     console.error(`[PLG056E] ${code} has no input screen`);
     return html(500, `<p>[PLG056E] ${escape(code)} has no input screen</p>`);
   }
@@ -72,18 +114,9 @@ export async function handle(method, path, request = {}) {
   const message = input.fields.map((f) => (f.literal ?? (f.dfld ? typed[f.dfld] ?? "" : "")).padEnd(f.length ?? 0).slice(0, f.length ?? undefined)).join("");
   const pcb = { input: message, output: /** @type {string[]} */ ([]), LTERM: "TERM0001", STATUS: "  " };
   console.log(`${code} ${request.aid ?? "Enter"}: ${JSON.stringify(message)}`);
-  try {
-    const program = await transaction.program();
-    await program[transaction.entry](pcb);
-  } catch (error) {
-    if (!(error instanceof Error && error.name === "Stop")) {
-      console.error(`[PLG057E] ${code} failed:\n`, error);
-      return json(500, { code, format, values: typed, error: `[PLG057E] ${code} failed: ${error instanceof Error ? error.message : String(error)}` });
-    }
-    console.log(`${code} ended with STOP`);
-  }
+  const error = await run(code, transaction, pcb);
+  if (error) return json(500, { code, format, values: typed, error });
   const reply = pcb.output[0];
-  console.log(`${code} replied: ${JSON.stringify(reply ?? null)}`);
   const output =
     (input.next ? transaction.screens.messages[input.next] : undefined) ??
     Object.values(transaction.screens.messages).find((m) => m.kind === "OUTPUT" && m.format === input.format);
