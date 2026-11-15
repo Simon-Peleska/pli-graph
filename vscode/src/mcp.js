@@ -76,6 +76,12 @@ const TOOLS = [
     inputSchema: { type: "object", properties: { path: { type: "string", description: "a program file's path in the workspace; empty for all" } } },
   },
   {
+    name: "data_owners",
+    description:
+      "Who owns the data, for replacing the system piece by piece: every IMS segment, Db2 table and dataset with the programs that insert, read, update and delete it, shared ones (written by more than one program) first, then owned ones (one writer), then read-only ones. Then the groups of programs writing the same data, which have to be replaced together, with the programs outside a group reading its data. A utility such as SORT counts as its own program in each step. Datasets no program writes are left out. For a file, the data its program uses; empty for the workspace.",
+    inputSchema: { type: "object", properties: { path: { type: "string", description: "a program file's path in the workspace; empty for all" } } },
+  },
+  {
     name: "program_files",
     description:
       "The files a PL/I program reads and writes (OPEN, READ, WRITE, REWRITE, DELETE, LOCATE, GET, PUT) with their records and keys, and the dataset each is in every JCL step that runs the program.",
@@ -490,6 +496,24 @@ function call(name, args) {
           `  ${c.table}.${c.column}${c.type ? ` ${c.type}` : ""}${c.path ? ` at ${c.path}:${c.line}` : ""}: ${c.programs} programs, ${c.procedures} procedures, ${c.uses} uses (${c.reads} read, ${c.writes} written, ${c.tests} in WHERE)${reached(c.transactions)}`,
       ),
       ...(hot.truncated ? ["Only the first 200 fields and 200 columns are shown."] : []),
+    ].join("\n");
+  }
+  if (name === "data_owners") {
+    const owners = open().dataOwners(args.path ?? "");
+    if (owners.resources.length === 0) return `No segment, table or dataset is used${args.path ? ` by ${args.path}` : ""}.`;
+    // A model's context holds less than the page.
+    const resources = owners.resources.slice(0, 200);
+    const groups = owners.groups.slice(0, 200);
+    const truncated = owners.truncated || resources.length < owners.resources.length || groups.length < owners.groups.length;
+    return [
+      "Data, shared first:",
+      ...resources.map(
+        (r) =>
+          `  ${r.status} ${r.kind} ${r.owner ? `${r.owner}.` : ""}${r.name}: ${r.programs.map((p) => `${p.program} ${p.operations.join("/")} (${p.path}:${p.line})`).join(", ")}`,
+      ),
+      groups.length ? "Programs writing the same data, to be replaced together:" : "No two programs write the same data.",
+      ...groups.map((g) => `  ${g.programs.join(", ")}: write ${g.writes.join(", ")}${g.readers.length ? `; read by ${g.readers.join(", ")}` : ""}`),
+      ...(truncated ? ["Only the first 200 pieces of data and 200 groups are shown."] : []),
     ].join("\n");
   }
   if (name === "messages") {

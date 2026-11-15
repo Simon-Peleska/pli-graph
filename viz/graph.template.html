@@ -237,7 +237,7 @@ body.flow-page > header, body.flow-page > #sides { display: none; }
 // The page asks VS Code for what each view draws; a big graph does not fit in
 // a page. byId keeps every node seen, for labels and links.
 const host = acquireVsCodeApi();
-const flowPage = ["flow", "data", "model", "crud", "use", "dead", "messages", "chain", "hot", "input", "column"].includes(new URLSearchParams(location.hash.slice(1)).get("v"));
+const flowPage = ["flow", "data", "model", "crud", "use", "dead", "messages", "chain", "hot", "owners", "input", "column"].includes(new URLSearchParams(location.hash.slice(1)).get("v"));
 const byId = new Map();
 const remember = nodes => { for (const n of nodes) byId.set(n.id, n); return nodes; };
 let asked = 0;
@@ -2054,6 +2054,82 @@ async function renderHot() {
   }
 }
 
+// ---- data owners ------------------------------------------------------------
+// Every segment, table and dataset with the programs that insert, read,
+// update and delete it, shared ones first, and the groups of programs writing
+// the same data, of a program (the id) or the workspace (v=owners).
+let ownersPath = "";
+function showOwners(path) {
+  ownersPath = path || "";
+  document.getElementById("flow-title").textContent = "";
+  document.getElementById("flow-depth-label").hidden = true;
+  document.getElementById("data-as").hidden = true;
+  document.getElementById("flow-body").replaceChildren();
+  renderOwners();
+}
+async function renderOwners() {
+  const mine = ++flowAsked;
+  const status = document.getElementById("flow-status"), error = document.getElementById("flow-error");
+  const fail = (code, message, cause) => {
+    console.error(`[${code}] ${message}`, cause || "");
+    error.textContent = `[${code}] ${message}`;
+    error.hidden = false;
+    status.textContent = "";
+  };
+  error.hidden = true;
+  status.textContent = "reading…";
+  const started = performance.now();
+  const what = `the data owners of ${ownersPath || "the workspace"}`;
+  let owners;
+  try {
+    owners = await ask("dataOwners", ownersPath);
+  } catch (cause) {
+    if (mine === flowAsked) fail("VIZ-143", `could not read ${what}: ${cause.message}`, cause);
+    return;
+  }
+  if (mine !== flowAsked) return;
+  if (!owners.resources.length) return fail("VIZ-144", `no segment, table or dataset is used${ownersPath ? ` by ${ownersPath}` : ""}`);
+  try {
+    const read = performance.now();
+    const open = (where) => () => host.postMessage({ type: "open", path: where.path, line: where.line });
+    const filter = el("input", { type: "search", placeholder: "filter by name, program or status", class: "filter" });
+    const list = el("div", {});
+    const draw = () => {
+      const wanted = filter.value.trim().toUpperCase();
+      const shows = (words) => !wanted || words.join(" ").toUpperCase().includes(wanted);
+      targets = [];
+      let row = 0;
+      const resources = owners.resources
+        .filter(r => shows([r.status, r.kind, r.owner ?? "", r.name, ...r.programs.map(p => p.program)]))
+        .map(r => el("tr", {},
+          el("td", {}, el("pre", {}, `${r.owner ? `${r.owner}.` : ""}${r.name}\n${r.kind}`)),
+          el("td", {}, r.status),
+          el("td", {}, ...r.programs.map(p => {
+            const node = el("pre", { title: `${p.path}:${p.line}`, onclick: open(p) }, `${p.program} ${p.operations.join("/")}`);
+            target(node, p, 0, row++);
+            return node;
+          }))));
+      const groups = owners.groups
+        .filter(g => shows([...g.programs, ...g.writes, ...g.readers]))
+        .map(g => el("tr", {}, el("td", {}, el("pre", {}, g.programs.join("\n"))), el("td", {}, el("pre", {}, g.writes.join("\n"))), el("td", {}, el("pre", {}, g.readers.join("\n")))));
+      list.replaceChildren(
+        el("section", {}, el("h3", { class: "in" }, "Data, shared first"),
+          resources.length ? table(["Data", "Status", "Programs"], resources) : el("div", { class: "guard" }, "nothing matches the filter")),
+        el("section", {}, el("h3", { class: "in" }, "Programs writing the same data, to be replaced together"),
+          groups.length ? table(["Programs", "Write", "Read by others"], groups) : el("div", { class: "guard" }, owners.groups.length ? "nothing matches the filter" : "no two programs write the same data")));
+    };
+    filter.addEventListener("input", draw);
+    draw();
+    document.getElementById("flow-body").replaceChildren(el("div", { class: "rules crud owners" }, filter, list,
+      owners.truncated ? el("div", { class: "guard" }, "only the first 2000 are shown") : ""));
+    status.textContent = "";
+    host.postMessage({ type: "route", hash: location.hash.slice(1), title: `Data Owners: ${ownersPath ? ownersPath.split("/").pop() : "all"}`, drawMs: Math.round(performance.now() - read), sinceLoadMs: Math.round(performance.now()) });
+    console.info(`[graph] ${what}: ${owners.resources.length} resources, ${owners.groups.length} groups, read in ${Math.round(read - started)} ms, drawn in ${Math.round(performance.now() - read)} ms`);
+  } catch (cause) {
+    fail("VIZ-145", `could not draw ${what}: ${cause.message}`, cause);
+  }
+}
+
 // The diagram tab shows a procedure's flow, a variable's data flow, a DDL
 // file's data model, what transactions or a procedure do to the data, the
 // dead code, the messages and codes, the batch chain, the hotspots, a screen's input rules
@@ -2066,8 +2142,9 @@ const isColumn = () => route().view === "column";
 const isMessages = () => route().view === "messages";
 const isChain = () => route().view === "chain";
 const isHot = () => route().view === "hot";
-const showDiagram = () => isModel() ? showModel(route().id) : route().view === "data" ? showData(route().id) : isCrud() ? showCrud(route().id) : isDead() ? showDead(route().id) : isMessages() ? showMessages(route().id) : isChain() ? showChain(route().id) : isHot() ? showHot(route().id) : isInput() ? showInput(route().id) : isColumn() ? showColumn(route().id) : showFlow(route().id);
-const renderDiagram = () => isModel() ? renderModel() : route().view === "data" ? renderData() : isCrud() ? renderCrud() : isDead() ? renderDead() : isMessages() ? renderMessages() : isChain() ? renderChain() : isHot() ? renderHot() : isInput() ? renderInput() : isColumn() ? renderColumn() : renderFlow();
+const isOwners = () => route().view === "owners";
+const showDiagram = () => isModel() ? showModel(route().id) : route().view === "data" ? showData(route().id) : isCrud() ? showCrud(route().id) : isDead() ? showDead(route().id) : isMessages() ? showMessages(route().id) : isChain() ? showChain(route().id) : isHot() ? showHot(route().id) : isOwners() ? showOwners(route().id) : isInput() ? showInput(route().id) : isColumn() ? showColumn(route().id) : showFlow(route().id);
+const renderDiagram = () => isModel() ? renderModel() : route().view === "data" ? renderData() : isCrud() ? renderCrud() : isDead() ? renderDead() : isMessages() ? renderMessages() : isChain() ? renderChain() : isHot() ? renderHot() : isOwners() ? renderOwners() : isInput() ? renderInput() : isColumn() ? renderColumn() : renderFlow();
 document.getElementById("flow-depth").addEventListener("input", renderDiagram);
 
 // ---- render ---------------------------------------------------------------

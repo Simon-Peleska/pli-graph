@@ -213,6 +213,8 @@ export class Graph {
     this.dead = undefined;
     /** @type {({ version: number | undefined } & ReturnType<Graph["countHotspots"]>) | undefined} */
     this.hot = undefined;
+    /** @type {({ version: number | undefined } & ReturnType<Graph["findOwners"]>) | undefined} */
+    this.owners = undefined;
     this.project = basename(root);
     /** Reads a file of the project; the extension hands in the open editors' text. */
     /** @type {(path: string) => string | undefined} */
@@ -1085,11 +1087,14 @@ export class Graph {
   /**
    * The CRUD matrix of the DL/I calls, SQL and record I/O in some files or
    * procedures (`by` says which `ids` are), with the PCBs of the PSB `psb`.
+   * The PCB parameters count in the main program: the files named like the
+   * PSB, or `main`. IMS puts the I/O PCB first unless `ioPcb` is false.
    * @param {"file" | "caller"} by
    * @param {number[]} ids
    * @param {string} psb
+   * @param {{ main?: number[], ioPcb?: boolean }} [program]
    */
-  dataUse(by, ids, psb) {
+  dataUse(by, ids, psb, { main, ioPcb = true } = {}) {
     const inside = JSON.stringify(ids);
     const gen = /** @type {{ id: number } | undefined} */ (this.all(`SELECT id FROM symbols WHERE kind = 'psb' AND name = ? ORDER BY id LIMIT 1`, psb)[0]);
     const pcbs = /** @type {{ id: number, position: number, type: string, name: string | null, dbd: string | null }[]} */ (
@@ -1098,9 +1103,9 @@ export class Graph {
     const sensitive = /** @type {{ name: string, dbd: string }[]} */ (
       gen ? this.all(`SELECT g.name, p.dbd FROM sensegs g JOIN pcbs p ON p.id = g.pcb WHERE p.psb = ? ORDER BY g.id`, gen.id) : []
     );
-    const calls = /** @type {{ function: string | null, pcb: string | null, pcb_parameter: number | null, segment: string | null, member: string, path: string, line: number }[]} */ (
+    const calls = /** @type {{ function: string | null, pcb: string | null, pcb_parameter: number | null, segment: string | null, file: number, member: string, path: string, line: number }[]} */ (
       this.all(
-        `SELECT d.function, d.pcb, d.pcb_parameter, d.segment, f.member, f.path, d.line
+        `SELECT d.function, d.pcb, d.pcb_parameter, d.segment, d.file, f.member, f.path, d.line
          FROM dli_calls d JOIN files f ON f.id = d.file WHERE d.${by} IN (SELECT value FROM json_each(?)) ORDER BY f.path, d.line`,
         inside,
       )
@@ -1142,8 +1147,8 @@ export class Graph {
     for (const call of calls) {
       const operation = DLI[call.function ?? ""];
       if (!operation) continue;
-      // A PCB parameter counts in the main program only; IMS puts the I/O PCB first.
-      const position = call.member === psb && call.pcb_parameter ? call.pcb_parameter - 1 : undefined;
+      const inMain = main ? main.includes(call.file) : call.member === psb;
+      const position = inMain && call.pcb_parameter ? call.pcb_parameter - (ioPcb ? 1 : 0) : undefined;
       const pcb = pcbs.find((p) => p.position === position);
       if (position === 0) {
         use("message", null, "I/O PCB", operation, `${call.function}${call.segment ? ` MOD ${call.segment}` : ""}`, call);
@@ -1181,6 +1186,174 @@ export class Graph {
     const operations = { insert: 0, read: 1, update: 2, delete: 3 };
     for (const resource of resources.values()) resource.uses.sort((a, b) => operations[a.operation] - operations[b.operation]);
     return { defined: gen !== undefined, resources: [...resources.values()].sort((a, b) => kinds[a.kind] - kinds[b.kind]) };
+  }
+
+  /**
+   * Who owns the data: for every IMS segment, Db2 table and dataset, the
+   * programs that insert, read, update and delete it; owned when one program
+   * writes it, shared when more do. Programs writing the same data are a
+   * group that has to be replaced together; the group's readers outside it
+   * are what depends on it. Worked out over the workspace once per graph
+   * version; `path` keeps what its program uses.
+   * @param {string} path
+   */
+  dataOwners(path) {
+    const version = Graph.version(this.db);
+    if (this.owners?.version !== version) this.owners = { version, ...this.findOwners() };
+    const { resources, groups, idsOf } = /** @type {NonNullable<Graph["owners"]>} */ (this.owners);
+    const file = path ? /** @type {{ id: number } | undefined} */ (this.all(`SELECT id FROM files WHERE path = ?`, path)[0])?.id : undefined;
+    if (path && file === undefined) return { resources: [], groups: [], truncated: false };
+    // A program's own file or an include: the programs it is part of.
+    const programs = new Set([...idsOf].filter(([, ids]) => ids.includes(/** @type {number} */ (file))).map(([member]) => member));
+    const shown = path ? resources.filter((r) => r.programs.some((p) => programs.has(p.program))) : resources;
+    const joined = path ? groups.filter((g) => g.programs.some((p) => programs.has(p)) || g.readers.some((p) => programs.has(p))) : groups;
+    const limit = 2000;
+    return { resources: shown.slice(0, limit), groups: joined.slice(0, limit), truncated: shown.length > limit || joined.length > limit };
+  }
+
+  /**
+   * The workspace's data and its programs for `dataOwners`.
+   * @typedef {"insert" | "read" | "update" | "delete"} Operation
+   * @typedef {{ program: string, operations: Operation[], path: string, line: number }} Use
+   * @returns {{ resources: { kind: "segment" | "table" | "dataset", owner: string | null, name: string, programs: Use[], writers: string[], status: "shared" | "owned" | "read only" }[], groups: { programs: string[], writes: string[], readers: string[] }[], idsOf: Map<string, number[]> }}
+   */
+  findOwners() {
+    /** @type {Map<string, { kind: "segment" | "table" | "dataset", owner: string | null, name: string, programs: Use[] }>} */
+    const resources = new Map();
+    /** @param {"segment" | "table" | "dataset"} kind @param {string | null} owner @param {string} name @param {string} program @param {Operation} operation @param {{ path: string, line: number }} at */
+    const use = (kind, owner, name, program, operation, at) => {
+      const key = `${kind} ${owner} ${name}`;
+      if (!resources.has(key)) resources.set(key, { kind, owner, name, programs: [] });
+      const programs = /** @type {Use[]} */ (resources.get(key)?.programs);
+      const known = programs.find((p) => p.program === program);
+      if (!known) programs.push({ program, operations: [operation], path: at.path, line: at.line });
+      else if (!known.operations.includes(operation)) known.operations.push(operation);
+    };
+
+    // A program is a PL/I file nothing includes, with everything it includes.
+    const programs = /** @type {{ member: string, ids: string, data: number }[]} */ (
+      this.all(
+        `WITH RECURSIVE included(id) AS (SELECT l.target_file FROM refs r JOIN links l ON l.ref = r.id WHERE r.kind = 'include' AND l.target_file IS NOT NULL),
+         program(member, id) AS (
+           SELECT member, id FROM files WHERE language = 'pli' AND id NOT IN (SELECT id FROM included) /* full scan */
+           UNION
+           SELECT p.member, l.target_file FROM program p JOIN refs r ON r.file = p.id AND r.kind = 'include' JOIN links l ON l.ref = r.id WHERE l.target_file IS NOT NULL)
+         SELECT member, json_group_array(id) AS ids,
+           max(id IN (SELECT file FROM dli_calls) OR id IN (SELECT file FROM sql_columns WHERE table_name IS NOT NULL)) AS data
+         FROM program GROUP BY member`,
+      )
+    );
+    const idsOf = new Map(programs.map((p) => [p.member, /** @type {number[]} */ (JSON.parse(p.ids))]));
+
+    // DL/I and SQL, through the PSB the program runs under as in programDli.
+    // A segment of a program without a PSB is in the DBD of that name, when only one has it.
+    const dbdsOf = this.db.prepare(`SELECT DISTINCT y.name FROM segments s JOIN symbols y ON y.id = s.dbd WHERE s.name = ? LIMIT 2`);
+    for (const { member, data } of programs) {
+      if (!data) continue;
+      const ids = /** @type {number[]} */ (idsOf.get(member));
+      const runs = this.programDli(member).psbs[0];
+      for (const resource of this.dataUse("file", ids, runs?.name ?? member, { main: ids, ioPcb: runs?.ioPcb ?? true }).resources) {
+        if (resource.kind !== "segment" && resource.kind !== "table") continue;
+        const dbds = resource.kind === "segment" && resource.owner === null ? /** @type {{ name: string }[]} */ (dbdsOf.all(resource.name)) : [];
+        const owner = dbds.length === 1 ? dbds[0].name : resource.owner;
+        // A segment not known by name is the program's own, so it joins no programs.
+        const name = resource.name === "?" ? `? in ${member}` : resource.name;
+        for (const u of resource.uses) use(resource.kind, owner, name, member, u.operation, u);
+      }
+    }
+
+    // Datasets, through the DDs of the steps running a program: what the
+    // program does through the DD, else what its DISP says. A utility such as
+    // SORT is a program of its own in each step, so it ties no groups together.
+    /** @type {Record<string, Operation>} */
+    const IO = { READ: "read", GET: "read", WRITE: "insert", LOCATE: "insert", PUT: "insert", REWRITE: "update", DELETE: "delete" };
+    /** @type {Map<string, Map<string, Set<Operation>>>} */
+    const throughDds = new Map();
+    const operationsOf = (/** @type {string} */ program) => {
+      const known = throughDds.get(program);
+      if (known) return known;
+      const ios = /** @type {{ operation: string, name: string, title: string | null }[]} */ (
+        this.all(`SELECT operation, name, title FROM file_io WHERE file IN (SELECT value FROM json_each(?))`, JSON.stringify(idsOf.get(program)))
+      );
+      const titles = new Map(ios.filter((io) => io.title).map((io) => [io.name, /** @type {string} */ (io.title)]));
+      /** @type {Map<string, Set<Operation>>} */
+      const byDd = new Map();
+      for (const io of ios) {
+        const operation = IO[io.operation];
+        if (!operation) continue;
+        const dd = titles.get(io.name) ?? io.name;
+        byDd.set(dd, (byDd.get(dd) ?? new Set()).add(operation));
+      }
+      throughDds.set(program, byDd);
+      return byDd;
+    };
+    // IKJEFT01 runs the Db2 program of the `RUN PROGRAM` in its SYSTSIN, before the next step.
+    const dds = /** @type {{ dsn: string, dd: string, disp: string | null, program: string | null, step: string | null, job: string | null, path: string, line: number }[]} */ (
+      this.all(
+        `SELECT d.dsn, d.name AS dd, d.disp, s.name AS step, j.name AS job, f.path, d.line,
+           CASE WHEN s.program = 'IKJEFT01' THEN coalesce((
+             SELECT r.name FROM refs r WHERE r.file = s.file AND r.kind = 'program' AND r.line > s.line
+               AND NOT EXISTS (SELECT 1 FROM steps n WHERE n.file = s.file AND n.line > s.line AND n.line <= r.line)
+             ORDER BY r.line LIMIT 1), s.program) ELSE s.program END AS program
+         FROM dds d JOIN steps s ON s.id = d.step JOIN files f ON f.id = d.file LEFT JOIN symbols j ON j.id = s.job
+         WHERE d.dsn IS NOT NULL /* full scan */ ORDER BY f.path, d.line`,
+      )
+    );
+    for (const d of dds) {
+      const own = d.program !== null && idsOf.has(d.program);
+      const program = own ? /** @type {string} */ (d.program) : `${d.program ?? "?"} in ${d.job ?? "?"} ${d.step ?? "?"}`;
+      const through = own ? operationsOf(program).get(d.dd) : undefined;
+      // A DD without DISP, or without its first part as in (,CATLG), creates its dataset, as in JCL.
+      const operations = through?.size ? [...through] : [/** @type {Operation} */ (/^(NEW|MOD|,|$)/.test(d.disp ?? "NEW") ? "insert" : "read")];
+      // A && dataset lives only as long as its job; the same name in another job is another dataset.
+      const dataset = d.dsn.startsWith("&&") ? `${d.dsn} in ${d.job ?? "?"}` : d.dsn;
+      for (const operation of operations) use("dataset", null, dataset, program, operation, d);
+    }
+
+    const writes = (/** @type {Use} */ p) => p.operations.some((o) => o !== "read");
+    // Datasets nobody writes are libraries or input from outside, as in batchChain.
+    const kept = [...resources.values()].filter((r) => r.kind !== "dataset" || r.programs.some(writes));
+    const order = { insert: 0, read: 1, update: 2, delete: 3 };
+    const owned = kept.map((r) => {
+      for (const p of r.programs) p.operations.sort((a, b) => order[a] - order[b]);
+      const writers = r.programs.filter(writes).map((p) => p.program);
+      /** @type {"shared" | "owned" | "read only"} */
+      const status = writers.length === 0 ? "read only" : writers.length === 1 ? "owned" : "shared";
+      return { ...r, writers, status };
+    });
+    const kinds = { segment: 0, table: 1, dataset: 2 };
+    const statuses = { shared: 0, owned: 1, "read only": 2 };
+    owned.sort((a, b) => statuses[a.status] - statuses[b.status] || b.writers.length - a.writers.length || kinds[a.kind] - kinds[b.kind] || a.name.localeCompare(b.name));
+
+    // Programs writing the same data, joined: union-find over the writers.
+    /** @type {Map<string, string>} */
+    const parent = new Map();
+    const root = (/** @type {string} */ p) => {
+      while (parent.get(p) !== p) p = /** @type {string} */ (parent.get(p));
+      return p;
+    };
+    for (const r of owned) {
+      for (const w of r.writers) if (!parent.has(w)) parent.set(w, w);
+      for (const w of r.writers.slice(1)) parent.set(root(w), root(r.writers[0]));
+    }
+    /** @type {Map<string, { programs: string[], writes: string[], readers: Set<string> }>} */
+    const byRoot = new Map();
+    for (const r of owned) {
+      if (r.writers.length === 0) continue;
+      const top = root(r.writers[0]);
+      if (!byRoot.has(top)) byRoot.set(top, { programs: [], writes: [], readers: new Set() });
+      byRoot.get(top)?.writes.push(`${r.owner ? `${r.owner}.` : ""}${r.name}`);
+    }
+    for (const p of parent.keys()) byRoot.get(root(p))?.programs.push(p);
+    for (const r of owned) {
+      const group = r.writers.length ? byRoot.get(root(r.writers[0])) : undefined;
+      for (const p of r.programs) if (group && !group.programs.includes(p.program)) group.readers.add(p.program);
+    }
+    const groups = [...byRoot.values()]
+      .filter((g) => g.programs.length > 1)
+      .map((g) => ({ programs: g.programs.sort(), writes: g.writes.sort(), readers: [...g.readers].sort() }))
+      .sort((a, b) => b.programs.length - a.programs.length || a.programs[0].localeCompare(b.programs[0]));
+    return { resources: owned, groups, idsOf };
   }
 
   /**

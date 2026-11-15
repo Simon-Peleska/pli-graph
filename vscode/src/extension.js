@@ -194,6 +194,7 @@ export function activate(context) {
     vscode.commands.registerCommand("pliGraph.messages", () => showMessages(context)),
     vscode.commands.registerCommand("pliGraph.batchChain", () => showBatchChain(context)),
     vscode.commands.registerCommand("pliGraph.hotspots", () => showHotspots(context)),
+    vscode.commands.registerCommand("pliGraph.dataOwners", () => showDataOwners(context)),
     vscode.commands.registerCommand("pliGraph.screenInput", () => showScreenInput(context)),
     vscode.commands.registerCommand("pliGraph.columnPath", () => showColumnPath(context)),
     vscode.commands.registerCommand("pliGraph.coverage", () => showCoverage(context)),
@@ -1236,6 +1237,19 @@ function showHotspots(context) {
   const path = shown.where && shown.graph.module(shown.where.path) ? shown.where.path : "";
   log.info(`hotspots of ${path || "the workspace"}`);
   openPage(context, shown.workspace, "flow", `v=hot&id=${encodeURIComponent(path)}`, `Hotspots: ${path ? path.split("/").pop() : "all"}`, true);
+}
+
+/**
+ * Who writes the data the active program uses, else all the workspace's,
+ * and the programs that have to be replaced together.
+ * @param {vscode.ExtensionContext} context
+ */
+function showDataOwners(context) {
+  const shown = workspaceShown();
+  if (!shown) return;
+  const path = shown.where && shown.graph.module(shown.where.path)?.language === "pli" ? shown.where.path : "";
+  log.info(`data owners of ${path || "the workspace"}`);
+  openPage(context, shown.workspace, "flow", `v=owners&id=${encodeURIComponent(path)}`, `Data Owners: ${path ? path.split("/").pop() : "all"}`, true);
 }
 
 /**

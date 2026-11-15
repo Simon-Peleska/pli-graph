@@ -234,6 +234,53 @@ test("hotspots rank the fields and columns used by the most programs, with the t
   assert.deepEqual(one.columns.map((/** @type {any} */ c) => `${c.table}.${c.column}`), ["KUNDE.KDNR", "KUNDE.SALDO"]);
 });
 
+test("data owners list who writes each segment, table and dataset, and group the programs writing the same data", () => {
+  const graph = new Graph(db, root);
+  const resource = (/** @type {any} */ r) =>
+    `${r.status} ${r.kind} ${r.owner ? `${r.owner}.` : ""}${r.name}: ${r.programs.map((/** @type {any} */ p) => `${p.program} ${p.operations.join("/")}`).join(", ")}`;
+  const all = graph.dataOwners("");
+  assert.deepEqual(all.resources.map(resource), [
+    "shared table PROD.KUNDE: KDP00004 read/update, KDP00013 read/update, KDP00014 read",
+    "owned segment KDDBD01.KONTO: KDP00005 read/update/delete",
+    "owned table PROD.BUCHUNG: KDP00004 insert/read",
+    "owned dataset PROD.KD.AUSZUG: KDP00001 insert, KDDRUCK read",
+    "owned dataset PROD.KD.MAHNUNG: KDP00017 insert, KDDRUCK read",
+    "owned dataset PROD.KD.SALDEN: KDP00014 insert, KDP00017 read",
+    "read only segment KDDBD01.KUNDE: KDP00005 read, KDP00008 read",
+  ]);
+  assert.deepEqual(all.groups, [{ programs: ["KDP00004", "KDP00013"], writes: ["PROD.BUCHUNG", "PROD.KUNDE"], readers: ["KDP00014"] }]);
+  assert.equal(all.truncated, false);
+  const one = graph.dataOwners("SRC/KDP00014");
+  assert.deepEqual(one.resources.map((r) => r.name), ["KUNDE", "PROD.KD.SALDEN"]);
+  assert.deepEqual(one.groups, [{ programs: ["KDP00004", "KDP00013"], writes: ["PROD.BUCHUNG", "PROD.KUNDE"], readers: ["KDP00014"] }]);
+  assert.deepEqual(graph.dataOwners("SRC/NOPE"), { resources: [], groups: [], truncated: false });
+});
+
+test("data owners see SQL in includes, IKJEFT01's RUN PROGRAM, a batch PSB without I/O PCB, a job's own && datasets and utility steps", async () => {
+  const owners = join(import.meta.dirname, "owners");
+  const graph = new Graph(await indexed(owners), owners);
+  const resource = (/** @type {any} */ r) =>
+    `${r.status} ${r.kind} ${r.owner ? `${r.owner}.` : ""}${r.name}: ${r.programs.map((/** @type {any} */ p) => `${p.program} ${p.operations.join("/")}`).join(", ")}`;
+  const all = graph.dataOwners("");
+  assert.deepEqual(all.resources.map(resource), [
+    "shared table PROD.LOG: OWP00001 insert, OWP00002 insert",
+    "owned segment ? in OWP00005: OWP00005 insert",
+    "owned segment ? in OWP00006: OWP00006 insert",
+    "owned segment OWDBD01.KONTO: OWP00004 insert",
+    "owned table PROD.KONTO: OWP00003 update",
+    "owned dataset &&TEMP in OWJOB01: OWP00001 insert",
+    "owned dataset &&TEMP in OWJOB02: OWP00002 insert",
+    "owned dataset PROD.OW.EXPORT: OWP00003 insert, SORT in OWJOB03 SRT read",
+    "owned dataset PROD.OW.LISTE: IKJEFT01 in OWJOB05 DB2 insert, OWP00005 read",
+    "owned dataset PROD.OW.SORTED: SORT in OWJOB03 SRT insert",
+  ]);
+  assert.deepEqual(all.groups, [{ programs: ["OWP00001", "OWP00002"], writes: ["&&TEMP in OWJOB01", "&&TEMP in OWJOB02", "PROD.LOG"], readers: [] }]);
+  assert.deepEqual(graph.dataOwners("SRC/OWP00003").resources.map((r) => r.name), ["KONTO", "PROD.OW.EXPORT"]);
+  const include = graph.dataOwners("INCLUDE/OWSQL01");
+  assert.deepEqual(include.resources.map((r) => r.name), ["LOG", "&&TEMP in OWJOB01", "&&TEMP in OWJOB02"]);
+  assert.deepEqual(include.groups, all.groups);
+});
+
 test("CREATE TABLE gives each column its type, NOT NULL and key position", () => {
   assert.deepEqual(rows(`SELECT table_name, name, type, not_null, key, position FROM columns ORDER BY id`), [
     { table_name: "KUNDE", name: "KDNR", type: "CHAR(8)", not_null: 1, key: 1, position: 1 },

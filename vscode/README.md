@@ -210,6 +210,20 @@ extension keeps of each workspace folder:
   comment and file, and the IMS transactions reaching it. A field of an
   include counts once for all programs. A box filters by name, type,
   comment or transaction; a click opens the declaration.
+- **PL/I Graph: Show Data Owners** lists every IMS segment, Db2 table and
+  dataset the active program uses, or with none the whole workspace's, with
+  the programs that insert, read, update and delete it:
+  - shared when more than one program writes it, listed first;
+  - owned when one program does;
+  - read only when none does.
+
+  Below that come the groups of programs writing the same data, which have
+  to be replaced together, and the programs outside each group that read
+  its data.
+  - A utility such as SORT counts as a program of its own in each step.
+  - Datasets nobody writes are left out.
+
+  A box filters by name, program or status; a click opens the line.
 - **PL/I Graph: Show Input Rules of the Screen** takes the MFS format or
   message at the cursor (or the active file's) and lists, per field the user
   types, the variable of the program's I/O area it lands in, the conditions
@@ -385,7 +399,9 @@ extension keeps of each workspace folder:
   on, with the record each program writes or reads and its fields, of a
   JCL file, a program or all), `hotspots` (the fields and columns used
   by the most programs and procedures, with their reads, writes, tests and
-  transactions),
+  transactions), `data_owners` (every segment, table and dataset with the
+  programs that insert, read, update and delete it, shared, owned or read
+  only, and the groups of programs writing the same data),
   `program_files` (a program's files, records, keys and the datasets they
   are in), `table_columns` (a Db2 table's columns and the SQL statements
   that select, compare, set or insert each, with their host variables),
@@ -872,7 +888,9 @@ could not be drawn, `VIZ-136` the data flow could not be drawn as a
 decision table, `VIZ-137` the batch chain could not be read, `VIZ-138` no
 job writes a dataset, `VIZ-139` the batch chain could not be drawn, `VIZ-140` the hotspots
 could not be read, `VIZ-141` no field or column is used, `VIZ-142` the
-hotspots could not be drawn.
+hotspots could not be drawn, `VIZ-143` the data owners could not be read,
+`VIZ-144` no segment, table or dataset is used, `VIZ-145` the data owners
+could not be drawn.
 
 Don't install it next to the pli-lsp extension: both define the `pli`
 language, so highlighting would clash and trees would show twice.

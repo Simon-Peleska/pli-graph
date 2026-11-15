@@ -179,3 +179,63 @@ takes 640 ms, once per graph version, and the first 200 of each are shown;
 the top fields are those of the generator's shared record `RBM00061`, in 18
 programs. Limits: a field counts as tested only where its statement is an
 IF, WHEN, SELECT or DO, not when an assignment computes a flag from it.
+
+## 9. Data ownership
+
+Every IMS segment, Db2 table and dataset with the programs that insert,
+read, update and delete it, for cutting the system into pieces to replace.
+
+Status: built. The `data_owners` MCP tool and *Show Data Owners* (the active
+program's data, else the workspace's) list each one as:
+- shared: more than one program writes it;
+- owned: one program writes it;
+- read only: no program writes it.
+
+The data is listed shared first. Programs writing the same data are joined
+into groups (union-find over the writers). Each group has to be replaced
+together, and its readers outside the group are what depends on it.
+
+Where the facts come from:
+- A program is a PL/I file nothing includes, together with everything it
+  includes. SQL in a shared include counts for each program including it.
+- Segments and tables come from `dataUse`, through the PSB the program runs
+  under, as in `programDli`:
+  - the PSB named like the program, else the PSB of its first JCL step;
+  - as DLI batch without `CMPAT=YES` there is no I/O PCB, so PCB
+    parameter 1 is the first database PCB.
+  - A segment of a program without a PSB goes to the one DBD that has a
+    segment of that name.
+- Datasets come from the DDs of the steps running a program. The operation
+  is what the program does through the DD, else its DISP.
+  - An IKJEFT01 step runs the program of the `RUN PROGRAM` in its SYSTSIN.
+  - A `&&` dataset is one per job (`&&TEMP in JOB`).
+- A utility such as SORT is a program of its own in each step, so it ties no
+  groups together.
+- Datasets nobody writes are left out, as in the batch chain.
+
+The regressions are in `vscode/test/owners`.
+
+On the sample the workspace takes about 520 ms, once per graph version. It
+finds 1,799 shared tables and 1,799 groups, because the generator writes
+each table from about ten programs that write no other shared table. The
+page shows the first 2000 resources and 2000 groups, the MCP tool the first
+200 of each.
+
+Limits:
+- A dataset written only through a DD of a non-PL/I step (IDCAMS, SORT)
+  counts that step as its writer.
+- Without file I/O through the DD, `DISP=OLD` counts as a read, as in the
+  batch chain, though IEBGENER's SYSUT2 or IDCAMS overwrite through it.
+- Dynamic SQL is not seen. A DL/I call with a computed segment name counts
+  as `? in PROGRAM`, one unknown segment per program.
+- A program with neither a PSB named like it nor a JCL step takes PCB
+  parameter 1 as the I/O PCB, so its batch calls through that PCB are lost.
+- Steps of JCL procedures name no job (`? in JOB STEP`), and a `&&` dataset
+  in a procedure file is `&&X in ?`.
+- Only the first PSB a program runs under counts, and only the first `RUN
+  PROGRAM` of an IKJEFT01 step.
+- Programs are told apart by member name, so two folders with the same
+  member are one program.
+
+From an include, *Show Data Owners* shows the data of the programs including
+it; from JCL it shows the workspace.

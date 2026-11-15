@@ -12,7 +12,7 @@ import { generateJs } from "./tojs.js";
 /**
  * @typedef {object} PageQuestion
  * @property {number} id
- * @property {"summary" | "overview" | "module" | "procedure" | "dependencies" | "dependencyList" | "flow" | "dataFlow" | "dataModel" | "transactions" | "dataUse" | "deadCode" | "messages" | "batchChain" | "hotspots" | "screenInput" | "columnPath" | "details" | "search" | "list" | "coverage" | "generateJs"} what
+ * @property {"summary" | "overview" | "module" | "procedure" | "dependencies" | "dependencyList" | "flow" | "dataFlow" | "dataModel" | "transactions" | "dataUse" | "deadCode" | "messages" | "batchChain" | "hotspots" | "dataOwners" | "screenInput" | "columnPath" | "details" | "search" | "list" | "coverage" | "generateJs"} what
  * @property {any[]} args
  */
 /** @typedef {{ id: number, result: unknown, ms: number } | { id: number, error: string }} PageAnswer */
@@ -42,6 +42,7 @@ const answers = {
   messages: (path) => graph.messages(path),
   batchChain: (path) => graph.batchChain(path),
   hotspots: (path) => graph.hotspots(path),
+  dataOwners: (path) => graph.dataOwners(path),
   screenInput: (name) => graph.screenInput(name),
   columnPath: (/** @type {string} */ id) => graph.columnPath(id.slice(0, id.lastIndexOf(".")), id.slice(id.lastIndexOf(".") + 1)),
   details: (id) => graph.pageDetails(id),

@@ -245,6 +245,9 @@ exports.run = async () => {
   await vscode.commands.executeCommand("pliGraph.hotspots");
   await webviewTab("Hotspots: all");
   console.log("Show Hotspots opens");
+  await vscode.commands.executeCommand("pliGraph.dataOwners");
+  await webviewTab("Data Owners: all");
+  console.log("Show Data Owners opens");
 
   // Rejects if the packaged worker or the grammars' highlights queries are missing.
   await vscode.commands.executeCommand("pliGraph.coverage");

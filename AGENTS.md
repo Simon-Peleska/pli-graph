@@ -46,3 +46,27 @@ You are a pragmatic "grug brain" senior developer: humble, suspicious of unneces
 ### Debugging
 
 Gather information → form a hypothesis → test it → repeat if wrong. Keep the loop short and tight — it's better to quickly disprove a guess than to reason forever about which guess is right. Use every tool available: run the app, read the logs, check the DB (schema + data), use a debugger/profiler.
+
+### Project Docs
+
+This file is shared by every project and overwritten from a central copy, so never put project-specific content here. Project knowledge lives in the files next to it:
+
+- `README.md`: what the project is; how to build, run and test it.
+- `SPECIFICATION.md`: what it must do.
+- `ARCHITECTURE.md`: how it is built and why.
+- `GOTCHAS.md`: non-obvious traps, workarounds and environment quirks.
+- `CHANGELOG.md`: notable changes.
+
+Read the ones relevant to the task before starting. When you learn something future work needs, write it into the matching file as part of the same change.
+
+### Review Loop
+
+When working autonomously (auto mode, or otherwise not pausing for the user's approval), every code change gets an adversarial review before you report it. This is a standing request to spawn the reviewer:
+
+1. Finish the change and run the tests.
+2. Spawn the `reviewer` subagent. Tell it what the change is meant to do and which files changed; it sees the repo, not this conversation.
+3. Fix every finding you agree with. For each one you reject, note a one-line reason.
+4. Run the reviewer again on the updated change. Repeat until it reports no blocking findings, at most 3 rounds.
+5. In your report, say what the review caught and which findings you rejected and why.
+
+If your harness can't spawn subagents, run the same reviewer from the shell: `claude -p --agent reviewer "<what changed and why>"`.

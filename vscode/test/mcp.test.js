@@ -33,7 +33,7 @@ test("the server introduces itself and lists its tools", () => {
   assert.equal(hello.result.serverInfo.name, "pli-graph");
   assert.deepEqual(
     list.result.tools.map((/** @type {any} */ t) => t.name),
-    ["find_definition", "find_references", "dependencies", "dependents", "dataset", "batch_chain", "hotspots", "program_files", "table_columns", "psb", "screen", "screen_input", "column_path", "dli", "transaction", "data_use", "dead_code", "messages", "decision_table", "field", "lineage", "text", "get_source", "query_graph"],
+    ["find_definition", "find_references", "dependencies", "dependents", "dataset", "batch_chain", "hotspots", "data_owners", "program_files", "table_columns", "psb", "screen", "screen_input", "column_path", "dli", "transaction", "data_use", "dead_code", "messages", "decision_table", "field", "lineage", "text", "get_source", "query_graph"],
   );
 });
 
@@ -83,6 +83,15 @@ test("hotspots ranks the fields and columns a program uses by how much of the co
     "  BUCHUNG.BETRAG DECIMAL(11,2) at INCLUDE/KDT00001:11: 1 programs, 1 procedures, 3 uses (2 read, 1 written, 0 in WHERE), transactions KD05",
   ]);
   assert.equal(none.result.content[0].text, "No field or column is used in JCL/KDJOB01.");
+});
+
+test("data_owners tells who writes each piece of data and which programs have to be replaced together", () => {
+  const [all, none] = serve([tool("data_owners", {}), tool("data_owners", { path: "SRC/KDP00016" })], facts);
+  const text = all.result.content[0].text.split("\n");
+  assert.equal(text[0], "Data, shared first:");
+  assert.match(text[1], /^ {2}shared table PROD\.KUNDE: KDP00004 read\/update \(SRC\/KDP00004:\d+\), KDP00013 read\/update \(SRC\/KDP00013:\d+\), KDP00014 read \(SRC\/KDP00014:\d+\)$/);
+  assert.deepEqual(text.slice(-2), ["Programs writing the same data, to be replaced together:", "  KDP00004, KDP00013: write PROD.BUCHUNG, PROD.KUNDE; read by KDP00014"]);
+  assert.equal(none.result.content[0].text, "No segment, table or dataset is used by SRC/KDP00016.");
 });
 
 test("batch_chain gives the jobs in order and what passes between them, down to the record", () => {

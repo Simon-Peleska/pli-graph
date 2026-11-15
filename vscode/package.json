@@ -206,6 +206,12 @@
         "icon": "$(flame)"
       },
       {
+        "command": "pliGraph.dataOwners",
+        "title": "Show Data Owners",
+        "category": "PL/I Graph",
+        "icon": "$(organization)"
+      },
+      {
         "command": "pliGraph.screenInput",
         "title": "Show Input Rules of the Screen",
         "category": "PL/I Graph",
