@@ -47,6 +47,10 @@ You are a pragmatic "grug brain" senior developer: humble, suspicious of unneces
 
 Gather information → form a hypothesis → test it → repeat if wrong. Keep the loop short and tight — it's better to quickly disprove a guess than to reason forever about which guess is right. Use every tool available: run the app, read the logs, check the DB (schema + data), use a debugger/profiler.
 
+### Commits
+
+When asked to commit, check whether the work mixes unrelated changes. If it does, split it into one commit per feature or fix, each self-contained and with its own message, instead of one commit for everything. Stage whole files where you can; to split changes inside one file, stage only some hunks by writing them to a patch and applying it with `git apply --cached`.
+
 ### Project Docs
 
 This file is shared by every project and overwritten from a central copy, so never put project-specific content here. Project knowledge lives in the files next to it:
