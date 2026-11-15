@@ -253,6 +253,9 @@ export function activate(context) {
       }
       vscode.window.visibleTextEditors.filter((editor) => editor.document === document).forEach(fitIndentation);
     }),
+    syntaxDiagnostics,
+    // A language change closes the document and opens it again under the new one.
+    vscode.workspace.onDidCloseTextDocument((document) => syntaxDiagnostics.delete(document.uri)),
     vscode.window.onDidChangeVisibleTextEditors((editors) => {
       editors.forEach((editor) => claimMember(editor.document));
       editors.forEach(fitIndentation);
@@ -289,6 +292,7 @@ export function deactivate() {
 }
 
 const SEMANTIC_LEGEND = new vscode.SemanticTokensLegend(TOKEN_TYPES, TOKEN_MODIFIERS);
+const syntaxDiagnostics = vscode.languages.createDiagnosticCollection("pliGraph.syntax");
 
 /**
  * Colors documents from the grammars' highlights queries.
@@ -303,12 +307,31 @@ function highlighting(grammars) {
       try {
         const builder = new vscode.SemanticTokensBuilder(SEMANTIC_LEGEND);
         const language = /** @type {import("./highlight.js").HighlightLanguage} */ (document.languageId);
-        for (const token of highlight(highlighter, language, document.getText())) {
+        const { tokens, errors } = highlight(highlighter, language, document.getText());
+        for (const token of tokens) {
           builder.push(token.line, token.char, token.length, token.type, token.modifiers);
         }
+        // Colored on every edit anyway: the same parse marks what the grammar could not read.
+        if (errors.length !== (syntaxDiagnostics.get(document.uri)?.length ?? 0)) {
+          const first = errors[0] ? `, the first at ${errors[0].start.row + 1}:${errors[0].start.column + 1} ${errors[0].text}` : "";
+          log.info(`[PLG100W] ${vscode.workspace.asRelativePath(document.uri)}: ${errors.length} syntax errors marked in the editor${first}`);
+        }
+        syntaxDiagnostics.set(
+          document.uri,
+          errors.map((e) => {
+            // An ERROR can run over many lines; the line where it starts is enough to see it.
+            const end = e.end.row === e.start.row && e.end.column > e.start.column ? e.end.column : document.lineAt(e.start.row).text.length;
+            const range = new vscode.Range(e.start.row, e.start.column, e.start.row, Math.max(end, e.start.column + 1));
+            const diagnostic = new vscode.Diagnostic(range, `Syntax the grammar does not read, ${e.text}: the facts here may be missing.`, vscode.DiagnosticSeverity.Warning);
+            diagnostic.code = "PLG100W";
+            diagnostic.source = "PL/I Graph";
+            return diagnostic;
+          }),
+        );
         return builder.build();
       } catch (error) {
         log.error(`[PLG015E] Highlighting ${document.uri.fsPath} failed.`, error);
+        syntaxDiagnostics.delete(document.uri);
         return undefined;
       }
     },
@@ -427,7 +450,10 @@ function startWorker(context) {
       log.error(`[${f.code}] ${what} ${f.path} failed; its facts are missing. Please report it with the file.\n${f.error}`);
     }
     for (const e of result.syntaxErrors) {
-      log.warn(`[PLG023W] ${e.path}:${e.line}: ${e.count} syntax error${e.count > 1 ? "s" : ""} the grammar does not know; facts there may be missing.`);
+      const more = e.count > e.places.length ? `, and ${e.count - e.places.length} more` : "";
+      log.warn(
+        `[PLG023W] ${e.path}:${e.line}: ${e.count} syntax error${e.count > 1 ? "s" : ""} the grammar does not know; facts there may be missing: ${e.places.join("; ")}${more}`,
+      );
     }
     if (result.syntaxErrors.length) {
       log.warn(`[PLG023W] ${workspace.folder.name}: ${result.syntaxErrors.length} of ${result.changed} files read have syntax the grammar does not know. The graph's files table lists them (syntax_errors, error_line).`);

@@ -47,10 +47,25 @@ test("a file the indexer fails on is logged and skipped, and the rest is read", 
   assert.deepEqual({ ...db.prepare("SELECT failure, (SELECT count(*) FROM symbols s WHERE s.file = f.id) AS symbols FROM files f WHERE path = 'BAD'").get() }, { failure: null, symbols: 1 });
 });
 
+test("a syntax error is reported where the grammar tripped, with the text there, not where the statement around it starts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-odd-"));
+  // 4 of 6 lines numbered are too few for the sequence numbers to be blanked.
+  const lines = [" NUM: PROC;", "   DCL A CHAR(1);", "   A = 'X';", "   A = 'Y';", "   A = 'Z';", " END NUM;"];
+  writeFileSync(join(root, "NUM"), lines.map((l, i) => (i < 4 ? `${l.padEnd(72)}${String((i + 1) * 100).padStart(8, "0")}` : l)).join("\n") + "\n");
+  const result = await sync(openGraph(join(root, ".graph.sqlite")), root, indexer);
+  assert.deepEqual(result.syntaxErrors, [
+    { path: "NUM", count: 4, line: 1, places: ['1:73 at "00000100"', '2:73 at "00000200"', '3:73 at "00000300"', '4:73 at "00000400"'] },
+  ]);
+  // An ERROR from line 1 around the one the grammar tripped on in line 3.
+  writeFileSync(join(root, "NUM"), " P: PROC;\n  DO;\n  X = (1 + ;\n END P;\n");
+  const nested = await sync(openGraph(join(root, ".graph.sqlite")), root, indexer);
+  assert.deepEqual(nested.syntaxErrors, [{ path: "NUM", count: 1, line: 3, places: ['3:3 at "X = (1 +"'] }]);
+});
+
 test("syntax the grammar does not know is counted, and what follows is still read", async () => {
   const { root, db } = folder();
   const result = await sync(db, root, indexer);
-  assert.deepEqual(result.syntaxErrors, [{ path: "ODD", count: 2, line: 3 }]);
+  assert.deepEqual(result.syntaxErrors, [{ path: "ODD", count: 2, line: 3, places: ['3:8 at "="', '3:14 at "))"'] }]);
   assert.deepEqual(
     db.prepare("SELECT path, syntax_errors, error_line FROM files ORDER BY path").all().map((r) => ({ ...r })),
     [

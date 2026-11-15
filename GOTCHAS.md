@@ -64,12 +64,32 @@
 - **One file never stops a sync.** If reading a file throws, its row is
   deleted, which cascades to every fact it wrote, and put back with only
   `failure` set (`PLG022E`); it is read again once it changes. A savepoint
-  per file did the same at 10% of the parse time. ERROR and MISSING nodes
-  are counted per file (`syntax_errors`, `PLG023W`) by visiting only
-  subtrees with `hasError`, so a clean file costs nothing. Syntax errors
-  inside `EXEC SQL` are not counted.
-- **`INIT((12)0)` parses with an ERROR node.** The grammar lacks repetition
-  factors; `variables.init` still holds the text `(12)0`.
+  per file did the same at 10% of the parse time. The innermost ERROR
+  nodes and the MISSING ones are counted per file (`syntax_errors`,
+  `PLG023W`) by visiting only subtrees with `hasError`, so a clean file
+  costs nothing. An ERROR around others can start many lines before what
+  the grammar tripped on, often at line 1, so only the innermost say where
+  the problem is. Syntax errors inside `EXEC SQL` are not counted. The
+  counts were wider before; a graph keeps the old ones for a file until it
+  changes.
+- **A missing `END` or an unclosed parenthesis can lose the whole
+  procedure.** The DO before a missing `END` takes the procedure's; an
+  unclosed `(` in a `WHEN` does the same to its SELECT. The root becomes an
+  ERROR (`1:2 at "P: PROC;"`), no `procedure` symbol is written and
+  Generate JavaScript translates nothing of it, so what it calls shows as
+  reached by nothing. Most syntax errors stay in their statement, which the
+  generator turns into a TODO; an error in a statement's head (up to its
+  `;` or `THEN`) makes the whole statement, body included, one TODO.
+  Statement handlers read only the parts they know (an IF its condition and
+  branches, a BEGIN its body), so an error elsewhere, after an `ELSE` or in
+  an ON unit, would vanish; after translating, every error the grammar
+  found that no TODO covers gets a TODO with its line at the module's end.
+- **Syntax errors are marked in the editor by the highlighting.** The
+  semantic tokens provider sets the warnings (`PLG100W`) from the parse it
+  colors with, so there is no second parse per keystroke. VS Code asks only
+  visible editors for tokens: a hidden tab changed on disk keeps its old
+  warnings until it is shown, and with `editor.semanticHighlighting.enabled`
+  off there are none.
 - **`VARYING` has no node of its own.** It is found in the attribute text.
 - **DSNs are kept as written.** `&&TEMP`, `*.STEP1.DD` back references and
   `&SYM` symbolic parameters are not resolved, so a dataset chain through

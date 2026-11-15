@@ -18,6 +18,7 @@ import { DatabaseSync } from "node:sqlite";
 import { Language, Parser } from "web-tree-sitter";
 import { GENERATED, MAIN_OPTIONS, PLI_BUILTINS, blankMargins, languageOf, sqlOperation } from "./source.js";
 import { mfsFields } from "./mfs.js";
+import { syntaxErrorNodes, syntaxErrorText } from "./highlight.js";
 
 /** @typedef {import("web-tree-sitter").Node} Node */
 
@@ -265,8 +266,9 @@ import { mfsFields } from "./mfs.js";
  * @property {ParsedAccess[]} accesses
  * @property {ParsedComparison[]} comparisons
  * @property {{ statement: number, text: string }[]} literals the string literals of a statement, without quotes
- * @property {number} syntaxErrors ERROR and MISSING nodes
+ * @property {number} syntaxErrors where the grammar tripped: the innermost ERROR nodes and the MISSING ones
  * @property {number | null} errorLine the first one's
+ * @property {string[]} errorPlaces the first few, as line:column and the text there
  * @property {(import("./mfs.js").MfsFieldFact & { symbol: number })[]} mfsFields symbol: position in the file's symbols of the format or message
  */
 
@@ -297,7 +299,7 @@ import { mfsFields } from "./mfs.js";
  * @property {number} resolved accesses linked to the variable they name
  * @property {number} resolveMs
  * @property {Failure[]} failures files whose facts are missing or incomplete
- * @property {{ path: string, count: number, line: number }[]} syntaxErrors files read in this sync with syntax the grammar does not know: how often, from which line
+ * @property {{ path: string, count: number, line: number, places: string[] }[]} syntaxErrors files read in this sync with syntax the grammar does not know: how often, from which line, and the first few places
  */
 
 /**
@@ -813,7 +815,7 @@ export async function sync(db, root, indexer, options = {}) {
   const total = removed.length + changed.length;
   /** @type {Failure[]} */
   const failures = [];
-  /** @type {{ path: string, count: number, line: number }[]} */
+  /** @type {SyncResult["syntaxErrors"]} */
   const syntaxErrors = [];
   const fresh = !options.paths && known.size === 0;
   // Parsing is most of a sync's time and needs no database, so many files
@@ -949,7 +951,7 @@ export async function sync(db, root, indexer, options = {}) {
         }
         const { language, parsed } = parse;
         file = Number(insertFile.run(path, language, memberOf(path), stat.mtime, stat.size, parsed.syntaxErrors, parsed.errorLine, null).lastInsertRowid);
-        if (parsed.syntaxErrors > 0) syntaxErrors.push({ path, count: parsed.syntaxErrors, line: parsed.errorLine ?? 0 });
+        if (parsed.syntaxErrors > 0) syntaxErrors.push({ path, count: parsed.syntaxErrors, line: parsed.errorLine ?? 0, places: parsed.errorPlaces });
         /** @type {number[]} */
         const symbolIds = [];
         for (const symbol of parsed.symbols) {
@@ -1249,13 +1251,14 @@ function memberOf(path) {
  */
 function parseFile(indexer, language, text) {
   /** @type {ParsedFile} */
-  const file = { symbols: [], refs: [], variables: [], steps: [], dds: [], fileIo: [], sqlColumns: [], columns: [], pcbs: [], sensegs: [], segments: [], segmentFields: [], dliCalls: [], mfsFields: [], statements: [], accesses: [], comparisons: [], literals: [], syntaxErrors: 0, errorLine: null };
+  const file = { symbols: [], refs: [], variables: [], steps: [], dds: [], fileIo: [], sqlColumns: [], columns: [], pcbs: [], sensegs: [], segments: [], segmentFields: [], dliCalls: [], mfsFields: [], statements: [], accesses: [], comparisons: [], literals: [], syntaxErrors: 0, errorLine: null, errorPlaces: [] };
   const tree = indexer[language].parse(language === "pli" || language === "hlasm" ? blankMargins(text, language) : text);
   if (!tree) return file;
   try {
     const errors = syntaxErrorsIn(tree.rootNode);
     file.syntaxErrors = errors.count;
     file.errorLine = errors.line;
+    file.errorPlaces = errors.places;
     switch (language) {
       case "pli":
         readPli(tree.rootNode, file, indexer.db2);
@@ -1282,26 +1285,11 @@ function parseFile(indexer, language, text) {
   return file;
 }
 
-/**
- * The ERROR and MISSING nodes, and the first line with one. Only subtrees
- * with an error are visited.
- * @param {Node} root
- */
+/** How many syntax errors there are, the first line with one and where the first few are. @param {Node} root */
 function syntaxErrorsIn(root) {
-  let count = 0;
-  /** @type {number | null} */
-  let line = null;
-  if (!root.hasError) return { count, line };
-  for (let stack = [root], node = stack.pop(); node; node = stack.pop()) {
-    if (node.type === "ERROR" || node.isMissing) {
-      count++;
-      const at = node.startPosition.row + 1;
-      if (line === null || at < line) line = at;
-      if (node.isMissing) continue;
-    }
-    for (const child of node.children) if (child && (child.hasError || child.isMissing)) stack.push(child);
-  }
-  return { count, line };
+  const found = syntaxErrorNodes(root);
+  const places = found.slice(0, 5).map((node) => `${node.startPosition.row + 1}:${node.startPosition.column + 1} ${syntaxErrorText(node)}`);
+  return { count: found.length, line: found.length ? found[0].startPosition.row + 1 : null, places };
 }
 
 /**

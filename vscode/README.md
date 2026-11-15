@@ -764,9 +764,11 @@ so on them only the silent gaps apply.
 - `PLG022E` reading a file failed on a shape the indexer does not handle;
   the sync goes on without that file's facts. Please report it with the file.
 - `PLG023W` a file has syntax the grammar does not know, one line per file
-  and a count per sync. Everything around it is still read;
+  with the first 5 places as line:column and the text the grammar tripped
+  on (`1:73 at "00000100"` is a sequence number that was not blanked, see
+  GOTCHAS.md), and a count per sync. Everything around it is still read;
   `SELECT path, syntax_errors, error_line FROM files WHERE syntax_errors > 0`
-  lists them all.
+  lists them all. Generate JavaScript makes such a statement a TODO.
 - `PLG024E` resolving a file's field accesses failed; they stay unresolved.
 - `PLG025E` a parser thread stopped (crashed or ran out of memory) while
   reading a file; the sync goes on without that file's facts. Please report
@@ -910,6 +912,9 @@ so on them only the silent gaps apply.
 - `PLG098E` Describe…: searching the subjects failed.
 - `PLG099E` MCP describe: an agent tried to replace a description not
   labelled `ai agent`; it adds a new one instead.
+- `PLG100W` An open file has syntax the grammar does not read: each place is
+  a warning in the editor and the Problems view, and the log gets one line
+  whenever a file's count changes.
 
 The graph page's own codes: `VIZ-101` the id in the URL is not in the graph,
 `VIZ-102` a view could not be drawn, `VIZ-103` the details, `VIZ-104` the

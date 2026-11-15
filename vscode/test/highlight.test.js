@@ -13,7 +13,7 @@ const highlighter = await createHighlighter(join(import.meta.dirname, "../gramma
  */
 function tokens(language, text) {
   const lines = text.split(/\r?\n/);
-  return highlight(highlighter, language, text).map((token) => {
+  return highlight(highlighter, language, text).tokens.map((token) => {
     const modifiers = TOKEN_MODIFIERS.filter((_, bit) => token.modifiers & (1 << bit));
     return `${[TOKEN_TYPES[token.type], ...modifiers].join(".")} ${lines[token.line].slice(token.char, token.char + token.length)}`;
   });
@@ -43,6 +43,12 @@ test("a fixed-format file's sequence numbers are no code", () => {
   assert.ok(!found.some((token) => token.includes("00010000")), found.join(", "));
 });
 
+test("the parse that colors a document also finds where the grammar tripped", () => {
+  const { errors } = highlight(highlighter, "pli", " P: PROC;\n  DO;\n  X = (1 + ;\n END P;\n");
+  assert.deepEqual(errors, [{ start: { row: 2, column: 2 }, end: { row: 2, column: 10 }, text: 'at "X = (1 +"' }]);
+  assert.deepEqual(highlight(highlighter, "pli", " P: PROC;\n END P;\n").errors, []);
+});
+
 test("JCL, MFS and Db2 files get tokens", () => {
   assert.ok(tokens("jcl", "//ABJOB01 JOB (ACCT)\n//S1 EXEC PGM=ABMAIN01\n").length > 0);
   assert.ok(tokens("hlasm", "CUSTFMT  FMT\n         FMTEND\n").length > 0);
@@ -58,7 +64,7 @@ test("every sample file highlights in order, no token past its line", () => {
       const text = readFileSync(join(root, folder, name), "utf-8");
       const lines = text.split("\n");
       let last = { line: 0, end: 0 };
-      for (const token of highlight(highlighter, language, text)) {
+      for (const token of highlight(highlighter, language, text).tokens) {
         assert.ok(token.line > last.line || token.char >= last.end, `${folder}/${name}:${token.line + 1} out of order`);
         assert.ok(token.char + token.length <= lines[token.line].replace(/\r$/, "").length, `${folder}/${name}:${token.line + 1} past the line`);
         last = { line: token.line, end: token.char + token.length };

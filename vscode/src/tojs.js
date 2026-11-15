@@ -5,6 +5,7 @@
 
 import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { syntaxErrorNodes } from "./highlight.js";
 import { mfsFields, mfsFormats } from "./mfs.js";
 import { PLI_BUILTINS, blankMargins, bytes, ddlTables } from "./source.js";
 
@@ -598,6 +599,8 @@ function programToJs(db, root, indexer, path) {
   let statements = 0;
   /** @type {Set<number>} the statements with a TODO, not counted as translated */
   const failed = new Set();
+  /** @type {{ path: string, start: number, end: number }[]} the source a TODO already stands for */
+  const covered = [];
   let groups = 0;
   /** @type {Map<string, string>} module constants: the message layouts */
   const layouts = new Map();
@@ -655,12 +658,14 @@ function programToJs(db, root, indexer, path) {
   const todoStatement = (node, depth, why) => {
     todos.push({ path: current.path, line: lineOf(node), why, end: node.endPosition.row + 1 });
     failed.add(node.id);
+    covered.push({ path: current.path, start: node.startIndex, end: node.endIndex });
     emit(depth, `// TODO: ${why}, line ${lineOf(node)}:`);
     for (const line of node.text.split("\n")) emit(depth, `//   ${line.trim()}`);
   };
   /** @param {Node} node @param {string} why @param {At} at @returns {Expr} */
   const todoExpr = (node, why, at) => {
     todos.push({ path: current.path, line: at.line, why });
+    covered.push({ path: current.path, start: node.startIndex, end: node.endIndex });
     return { code: `todo(${JSON.stringify(`${why}: ${node.text.replace(/\s+/g, " ")}`)})`, kind: "unknown" };
   };
 
@@ -846,6 +851,7 @@ function programToJs(db, root, indexer, path) {
 
   /** @param {Node} node @param {At} at @returns {Expr} */
   const expr = (node, at) => {
+    if (node.hasError) return todoExpr(node, SYNTAX_ERROR, at);
     switch (node.type) {
       case "number": {
         const value = constant(node.text);
@@ -2287,6 +2293,15 @@ function programToJs(db, root, indexer, path) {
   /** @param {Node} node @param {number} depth @param {At} outer */
   const translate = (node, depth, outer) => {
     const at = { ...outer, line: lineOf(node) };
+    // What the grammar could not read is not in the tree: translating the rest would drop it without a word.
+    // An error in the head of a statement, up to its own ; or THEN, is the whole statement's; one after it
+    // is in a statement of the body and gets its own TODO there.
+    if (node.hasError) {
+      const end = node.children.findIndex((c) => c !== null && !c.isNamed && (c.type === ";" || c.type === "then"));
+      const holds = node.namedChildren.some((c) => c && (c.type.endsWith("_statement") || c.type === "block"));
+      const head = end >= 0 ? node.children.slice(0, end + 1) : holds ? [] : node.children;
+      if (node.type === "ERROR" || head.some((c) => c && (c.hasError || c.isMissing))) return todoStatement(node, depth, SYNTAX_ERROR);
+    }
     switch (node.type) {
       case "comment":
         if (node.nextNamedSibling?.type === "declare_statement") return; // the declaration's JSDoc has it
@@ -2546,6 +2561,20 @@ function programToJs(db, root, indexer, path) {
     if (!node || node.type === "comment") continue;
     statement(node, 0, top);
   }
+  // The statement handlers read only the parts they know, so a syntax error
+  // after an ELSE, in a BEGIN or an ON unit would vanish without this.
+  for (const [id, r] of [[file.id, tree.rootNode], ...[...includeTrees].map(([id, i]) => [id, i.tree?.rootNode])]) {
+    if (!r) continue;
+    current = { id: /** @type {number} */ (id), path: /** @type {string} */ (filePaths.get(/** @type {number} */ (id))) };
+    const sourceLines = /** @type {Node} */ (r).text.split("\n");
+    for (const node of syntaxErrorNodes(/** @type {Node} */ (r))) {
+      if (covered.some((c) => c.path === current.path && c.start <= node.startIndex && node.endIndex <= c.end)) continue;
+      todos.push({ path: current.path, line: lineOf(node), why: SYNTAX_ERROR });
+      emit(0, `// TODO: ${SYNTAX_ERROR}, line ${lineOf(node)}:`);
+      emit(0, `//   ${sourceLines[node.startPosition.row].trim()}`);
+    }
+  }
+  current = { id: file.id, path };
 
   const code = [...(statics.length ? [...statics, ""] : []), ...lines, ""].join("\n");
   const usedLayouts = [...layouts].filter(([name]) => new RegExp(`\\b${name.replace(/\$/g, "\\$")}\\(`).test(code) || name.endsWith("_FIELDS"));
@@ -2560,6 +2589,8 @@ function programToJs(db, root, indexer, path) {
   ];
   return { code: [...header, moduleBody].join("\n"), statements, todos, calls: [...calls], includes };
 }
+
+const SYNTAX_ERROR = "a syntax error, code the grammar does not read (PLG023W)";
 
 /** The statements that translate to plain code, without await. A CALL depends on what it calls. */
 const SYNC_KINDS = new Set(["declare", "if", "do", "select", "when", "otherwise", "assignment", "call", "return", "leave", "iterate", "null", "stop", "goto"]);

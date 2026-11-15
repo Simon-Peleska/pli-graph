@@ -233,6 +233,64 @@ test("a function procedure called with empty parentheses runs", async () => {
   assert.equal(await ZZLEER(0), 110);
 });
 
+test("a statement with a syntax error is a TODO, and the rest of the program is still translated", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZSYNT"),
+    ` ZZSYNT: PROC(OUT);
+   DCL OUT FIXED BIN(15), I FIXED BIN(15);
+   OUT = = 1 ));
+   DO;
+   OUT = (1 + ;
+   END;
+   OUT = 7;
+   IF OUT = 4 ) THEN OUT = 5;
+   DO I = 1 TO ;
+     OUT = 4;
+   END;
+   IF OUT = = 7 THEN OUT = 8;
+ END ZZSYNT;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZSYNT"] });
+  const why = "a syntax error, code the grammar does not read (PLG023W)";
+  assert.deepEqual(summary.programs[0].todos.map((t) => [t.line, t.why]), [[3, why], [5, why], [8, why], [9, why], [12, why]]);
+  const { ZZSYNT } = await import(pathToFileURL(join(out, "programs/ZZSYNT.js")).href);
+  assert.equal(await ZZSYNT(0), 7);
+});
+
+test("a syntax error no statement handler reads is still a TODO", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "SRC"));
+  writeFileSync(
+    join(root, "SRC/ZZSYNU"),
+    ` ZZSYNU: PROC(OUT);
+   DCL OUT FIXED BIN(15), I FIXED BIN(15);
+   DCL F FILE;
+   L: DO I = 1 TO ;
+     OUT = 4;
+   END L;
+   IF OUT = 1 THEN OUT = 2;
+   ELSE IF OUT = 4 ) THEN OUT = 5;
+   BEGIN;
+     OUT = (8 + ;
+   END;
+   ON ENDFILE(F)) OUT = 1;
+   IF OUT = 2 THEN OUT = 3;
+   ELSE OUT = (1 + ;
+   DCL X FIXED BIN(15) INIT(;
+ END ZZSYNU;
+`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, paths: ["SRC/ZZSYNU"] });
+  const why = "a syntax error, code the grammar does not read (PLG023W)";
+  const lines = new Set(summary.programs[0].todos.filter((t) => t.why === why).map((t) => t.line));
+  for (const line of [4, 8, 10, 12, 14, 15]) assert.ok(lines.has(line), `line ${line} has no TODO: ${[...lines]}`);
+});
+
 test("LEAVE ends the innermost DO group, a loop or not, a GOTO to the END's label ends the pass, and the bounds of a field come from its array of structures", async () => {
   const root = mkdtempSync(join(tmpdir(), "pli-src-"));
   mkdirSync(join(root, "SRC"));

@@ -7,6 +7,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Language, Parser, Query } from "web-tree-sitter";
+/** @typedef {import("web-tree-sitter").Node} Node */
+/** @typedef {import("web-tree-sitter").Point} Point */
 import { blankMargins } from "./source.js";
 
 /** @typedef {"pli" | "jcl" | "hlasm" | "db2"} HighlightLanguage */
@@ -102,11 +104,42 @@ export async function createHighlighter(dir) {
 }
 
 /**
- * The semantic tokens of a document, in order, none spanning lines.
+ * Where the grammar tripped, in order: the innermost ERROR nodes and the
+ * MISSING ones. Only subtrees with an error are visited.
+ * @param {Node} root
+ * @returns {Node[]}
+ */
+export function syntaxErrorNodes(root) {
+  /** @type {Node[]} */
+  const found = [];
+  if (!root.hasError) return found;
+  for (let stack = [root], node = stack.pop(); node; node = stack.pop()) {
+    if (node.isMissing) {
+      found.push(node);
+      continue;
+    }
+    const inner = /** @type {Node[]} */ (node.children.filter((child) => child && (child.hasError || child.isMissing)));
+    // An ERROR around others can start lines before what the grammar tripped on.
+    if (node.type === "ERROR" && inner.length === 0) found.push(node);
+    stack.push(...inner);
+  }
+  return found.sort((a, b) => a.startIndex - b.startIndex);
+}
+
+/** `missing ";"`, or the text the grammar tripped on: `at "= 1 ))"`. @param {Node} node */
+export function syntaxErrorText(node) {
+  if (node.isMissing) return `missing "${node.type}"`;
+  const text = node.text.slice(0, 200).split("\n")[0].trim();
+  return `at "${text.length > 40 ? `${text.slice(0, 40)}…` : text}"`;
+}
+
+/**
+ * A document's semantic tokens, in order, none spanning lines, and the
+ * syntax errors the same parse found.
  * @param {Highlighter} highlighter
  * @param {HighlightLanguage} language
  * @param {string} text
- * @returns {Token[]}
+ * @returns {{ tokens: Token[], errors: { start: Point, end: Point, text: string }[] }}
  */
 export function highlight(highlighter, language, text) {
   // The style of every UTF-16 position, which is how tree-sitter counts
@@ -114,8 +147,9 @@ export function highlight(highlighter, language, text) {
   const styles = new Uint8Array(text.length);
   const parsed = language === "pli" || language === "hlasm" ? blankMargins(text, language) : text;
   const tree = highlighter[language].parser.parse(parsed);
-  if (!tree) return [];
+  if (!tree) return { tokens: [], errors: [] };
   paint(styles, highlighter[language].query, tree.rootNode, 0);
+  const errors = syntaxErrorNodes(tree.rootNode).map((node) => ({ start: node.startPosition, end: node.endPosition, text: syntaxErrorText(node) }));
 
   // EXEC SQL is only tokenized by the PL/I grammar; the Db2 grammar reads
   // the statement after the language name, as the indexer does.
@@ -153,7 +187,7 @@ export function highlight(highlighter, language, text) {
     tokens.push({ line, char: i - lineStart, length: end - i, ...STYLES[style] });
     i = end;
   }
-  return tokens;
+  return { tokens, errors };
 }
 
 /**
