@@ -171,19 +171,27 @@ export function blankMargins(text, language) {
   const lines = text.split("\n");
   const plain = lines.map((line) => line.replace(/\r$/, ""));
   const code = plain.filter((line) => line.trim());
-  if (code.length === 0 || plain.some((line) => line.length > 80)) {
+  if (code.length === 0) {
     return text;
   }
+  const wide = plain.some((line) => line.length > 80);
   /** @param {string} line */
   const isProcess = (line) => /^[*%]PROCESS/i.test(line);
   const numbered = code.filter((line) => line.slice(72).trim()).length;
-  const blankSequence = numbered * 10 >= code.length * 9;
+  const blankSequence = !wide && numbered * 10 >= code.length * 9;
   // The compiler reads from column 2. A numbered member is fixed-format, so
   // column 1 goes whatever it holds; otherwise only when what is there stands
   // alone (`X  DCL`, a change marker) and is no code written from column 1
-  // (`main: proc;`).
+  // (`main: proc;`). A file with a line past column 80 is no card image, but
+  // can still have carriage control (`1/*** HEADER`); there a digit could be
+  // code continued from column 1 (`1, 2, 3);`), so only `0`, `1`, `-` or `+`
+  // followed by a blank or a comment counts.
   const carriageControl =
-    language === "pli" && (blankSequence || code.every((line) => isProcess(line) || " 01-+".includes(line[0]) || line[1] === " " || line.length === 1));
+    language === "pli" &&
+    (blankSequence ||
+      code.every((line) =>
+        wide ? line[0] === " " || isProcess(line) || /^[01+-](?:[ \t]|\/\*|$)/.test(line) : isProcess(line) || " 01-+".includes(line[0]) || line[1] === " " || line.length === 1,
+      ));
   if (!carriageControl && !blankSequence) {
     return text;
   }

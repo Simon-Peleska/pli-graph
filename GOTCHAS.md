@@ -36,6 +36,12 @@
     code in the whole file; one marker followed straight by code (`XDCL`) in
     an unnumbered file does too, and its declarations are then not found.
 
+  A file with a line past column 80 is no card image: its sequence numbers
+  stay, and column 1 is blanked only when every code line has a blank there,
+  or `0`, `1`, `-` or `+` followed by a blank or a comment (`1/*** HEADER`):
+  a change marker or a digit can't be told from code continued from column
+  1 (`1, 2, 3);`). A `+ b;` continued from column 1 still loses its `+`.
+
   Columns 73-80 are blanked only when at least 90% of code lines have
   something there. A member numbered only in part (old lines numbered, new
   ones not) keeps its numbers, and each is a syntax error at column 73

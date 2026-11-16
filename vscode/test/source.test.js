@@ -63,6 +63,17 @@ test("a character in column 1 is no code: a change marker, or anything in a numb
   assert.equal(blankMargins(free, "pli"), free);
 });
 
+test("carriage control in column 1 goes in a file with lines past column 80 too", () => {
+  const wide = ["1/*** KURS00KO ***/", " K: PROC;", `   DCL ME CHAR(1); /* ${"x".repeat(80)} */`, " END K;"].join("\n");
+  assert.equal(blankMargins(wide, "pli").split("\n")[0], " /*** KURS00KO ***/");
+  // There it takes 0, 1, - or +; a change marker could be code from column 1.
+  const marked = ["X  DCL ME CHAR(1);", `   DCL YOU CHAR(1); /* ${"x".repeat(80)} */`].join("\n");
+  assert.equal(blankMargins(marked, "pli"), marked);
+  // Nor a list continued from column 1.
+  const continued = ["  DCL T(3) FIXED BIN INIT(", "1, 2, 3);", `  /* ${"x".repeat(80)} */`].join("\n");
+  assert.equal(blankMargins(continued, "pli"), continued);
+});
+
 test("in EXEC SQL, PL/I's not-equal and concatenation become Db2's, outside literals and comments", () => {
   const text = " IF A ^= B THEN C = D !! E;\n EXEC SQL SELECT ' '!!X!!'^=!!' INTO :Y FROM T /* ^= */\n   WHERE A ^= 'A' AND B ¬= 1 AND C ^> 2 AND D ¬< 3;\n X = Y !! Z;";
   assert.equal(
