@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   blankMargins,
+  db2Operators,
   ddlTables,
   insertBlanks,
   hlasmStatements,
@@ -60,6 +61,19 @@ test("a character in column 1 is no code: a change marker, or anything in a numb
   // Written from column 1, as off the mainframe: column 1 is code.
   const free = ["main: proc;", "  dcl me char(1);", "end main;"].join("\n");
   assert.equal(blankMargins(free, "pli"), free);
+});
+
+test("in EXEC SQL, PL/I's not-equal and concatenation become Db2's, outside literals and comments", () => {
+  const text = " IF A ^= B THEN C = D !! E;\n EXEC SQL SELECT ' '!!X!!'^=!!' INTO :Y FROM T /* ^= */\n   WHERE A ^= 'A' AND B ¬= 1 AND C ^> 2 AND D ¬< 3;\n X = Y !! Z;";
+  assert.equal(
+    db2Operators(text),
+    " IF A ^= B THEN C = D !! E;\n EXEC SQL SELECT ' '||X||'^=!!' INTO :Y FROM T /* ^= */\n   WHERE A <> 'A' AND B <> 1 AND C <= 2 AND D >= 3;\n X = Y !! Z;",
+  );
+  // EXEC SQL in a comment or a message is no SQL.
+  const mentioned = " /* EXEC SQL is used here */\n IF X ^= Y THEN X = 1;\n PUT SKIP LIST('EXEC SQL failed');\n IF X ^= Y THEN X = A !! B;";
+  assert.equal(db2Operators(mentioned), mentioned);
+  // A Db2 comment with an apostrophe opens no literal; ! stands for ¬ on some code pages.
+  assert.equal(db2Operators(" EXEC SQL SELECT A -- don't care\n   FROM T WHERE B != 1;"), " EXEC SQL SELECT A -- don't care\n   FROM T WHERE B <> 1;");
 });
 
 test("uses carry their qualifiers and know SQL and host variables", () => {

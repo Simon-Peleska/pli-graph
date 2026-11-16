@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import { Language, Parser } from "web-tree-sitter";
-import { GENERATED, MAIN_OPTIONS, PLI_BUILTINS, blankMargins, languageOf, sqlOperation } from "./source.js";
+import { GENERATED, MAIN_OPTIONS, PLI_BUILTINS, blankMargins, db2Operators, languageOf, sqlOperation } from "./source.js";
 import { mfsFields } from "./mfs.js";
 import { syntaxErrorNodes, syntaxErrorText } from "./highlight.js";
 
@@ -310,7 +310,7 @@ import { syntaxErrorNodes, syntaxErrorText } from "./highlight.js";
  */
 
 // Raise it whenever the indexer reads something new; graphs of an older one are read again.
-const INDEXER_VERSION = 28;
+const INDEXER_VERSION = 29;
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -1252,7 +1252,7 @@ function memberOf(path) {
 function parseFile(indexer, language, text) {
   /** @type {ParsedFile} */
   const file = { symbols: [], refs: [], variables: [], steps: [], dds: [], fileIo: [], sqlColumns: [], columns: [], pcbs: [], sensegs: [], segments: [], segmentFields: [], dliCalls: [], mfsFields: [], statements: [], accesses: [], comparisons: [], literals: [], syntaxErrors: 0, errorLine: null, errorPlaces: [] };
-  const tree = indexer[language].parse(language === "pli" || language === "hlasm" ? blankMargins(text, language) : text);
+  const tree = indexer[language].parse(language === "pli" ? db2Operators(blankMargins(text, language)) : language === "hlasm" ? blankMargins(text, language) : text);
   if (!tree) return file;
   try {
     const errors = syntaxErrorsIn(tree.rootNode);

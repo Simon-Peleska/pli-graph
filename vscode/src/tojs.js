@@ -7,7 +7,7 @@ import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } fro
 import { join } from "node:path";
 import { syntaxErrorNodes } from "./highlight.js";
 import { mfsFields, mfsFormats } from "./mfs.js";
-import { PLI_BUILTINS, blankMargins, bytes, ddlTables } from "./source.js";
+import { PLI_BUILTINS, blankMargins, bytes, db2Operators, ddlTables } from "./source.js";
 
 /** @typedef {import("web-tree-sitter").Node} Node */
 /**
@@ -305,7 +305,7 @@ function unresolvedChanges(db) {
 function programToJs(db, root, indexer, path) {
   const file = /** @type {{ id: number, member: string } | undefined} */ (db.prepare(`SELECT id, member FROM files WHERE path = ?`).get(path));
   if (!file) throw new Error(`[PLG053E] ${path} is not in the graph; index it first`);
-  const tree = indexer.pli.parse(blankMargins(readFileSync(join(root, path), "utf-8"), "pli"));
+  const tree = indexer.pli.parse(db2Operators(blankMargins(readFileSync(join(root, path), "utf-8"), "pli")));
   if (!tree) throw new Error(`[PLG054E] ${path} could not be parsed`);
 
   const included = /** @type {{ id: number }[]} */ (
@@ -323,8 +323,8 @@ function programToJs(db, root, indexer, path) {
   // includer's, translated where it stands, the file being read in `current`.
   /** @type {Map<number, { path: string, tree: import("web-tree-sitter").Tree | null }>} */
   const includeTrees = new Map();
-  for (const f of /** @type {{ id: number, path: string }[]} */ (db.prepare(`SELECT id, path FROM files WHERE id IN (SELECT value FROM json_each(?))`).all(JSON.stringify(included)))) {
-    includeTrees.set(f.id, { path: f.path, tree: indexer.pli.parse(blankMargins(readFileSync(join(root, f.path), "utf-8"), "pli")) });
+  for (const f of /** @type {{ id: number, path: string }[]} */ (db.prepare(`SELECT id, path FROM files WHERE id IN (SELECT value FROM json_each(?)) AND language = 'pli'`).all(JSON.stringify(included)))) {
+    includeTrees.set(f.id, { path: f.path, tree: indexer.pli.parse(db2Operators(blankMargins(readFileSync(join(root, f.path), "utf-8"), "pli"))) });
   }
   const roots = [tree.rootNode, ...[...includeTrees.values()].flatMap((i) => (i.tree ? [i.tree.rootNode] : []))];
   /** @param {string} type */

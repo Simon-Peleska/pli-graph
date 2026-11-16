@@ -36,6 +36,11 @@ test("EXEC SQL is read by the Db2 grammar", () => {
   assert.ok(found.includes("keyword SELECT"), found.join(", "));
 });
 
+test("PL/I's not-equal and concatenation in EXEC SQL are no syntax errors in the editor", () => {
+  const { errors } = highlight(highlighter, "pli", " S: PROC;\n  EXEC SQL SELECT ' '!!A INTO :I FROM T WHERE B ^= 'A';\n END S;\n");
+  assert.deepEqual(errors, []);
+});
+
 test("a fixed-format file's sequence numbers are no code", () => {
   const line = (/** @type {string} */ code) => ` ${code}`.padEnd(72) + "00010000";
   const found = tokens("pli", [line("X: PROC;"), line("CALL Y;"), line("END X;")].join("\n"));

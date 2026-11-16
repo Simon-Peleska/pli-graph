@@ -42,6 +42,13 @@
   (`PLG023W ... 1:73 at "00000100"`). A `MARGINS(...)` compiler option is
   not read. On the Zowe samples this brings parse errors from 3336 down
   to 134.
+- **`^=`, `¬=`, `!=` and `!!` in `EXEC SQL` are rewritten before parsing.**
+  The PL/I grammar reads the SQL itself and knows only `<>` and `||`, so
+  `db2Operators` (`vscode/src/source.js`) swaps them, same length, outside
+  literals and comments (`/* */` and `--`), for the indexer, the
+  highlighting and Generate JavaScript. Format Document does not, so it
+  still refuses such a file (`PLG039W`). The statement text the graph shows
+  is the original; generated SQL has the Db2 spelling.
 - **Tables and screens resolve by name.** Two DDL files defining `CUSTOMER`
   both get the link; a schema only narrows it when one of them matches. A
   PL/I string literal that happens to equal a format or message name links

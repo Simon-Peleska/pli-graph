@@ -201,6 +201,27 @@ export function blankMargins(text, language) {
     .join("\n");
 }
 
+/** @type {Record<string, string>} */
+const DB2_OPERATORS = { "^=": "<>", "¬=": "<>", "!=": "<>", "^>": "<=", "¬>": "<=", "!>": "<=", "^<": ">=", "¬<": ">=", "!<": ">=", "!!": "||" };
+
+// The PL/I grammar reads EXEC SQL itself and knows only Db2's not-equal and
+// concatenation, while PL/I programs also write ^=, ¬=, != and !! there. Each is
+// swapped for Db2's spelling of the same length, so every position stays;
+// string literals and comments are kept as they are.
+/**
+ * @param {string} text PL/I
+ * @returns {string}
+ */
+export function db2Operators(text) {
+  if (!/EXEC\s+SQL/i.test(text)) return text;
+  // One pass: a literal or comment outside SQL is passed over whole, so an
+  // EXEC SQL written in one starts nothing.
+  return text.replace(PLI_SQL, (found) => (/^EXEC/i.test(found) ? found.replace(IN_SQL, (op, kept) => kept ?? DB2_OPERATORS[op]) : found));
+}
+const LITERAL_OR_COMMENT = String.raw`'(?:[^']|'')*'|"(?:[^"]|"")*"|\/\*[\s\S]*?(?:\*\/|$)`;
+const PLI_SQL = new RegExp(String.raw`${LITERAL_OR_COMMENT}|\bEXEC\s+SQL\b(?:${LITERAL_OR_COMMENT}|--[^\n]*|[^;'"/-]|-(?!-)|\/(?!\*))*`, "gi");
+const IN_SQL = new RegExp(String.raw`(${LITERAL_OR_COMMENT}|--[^\n]*)|[\^¬!][=<>]|!!`, "g");
+
 // PL/I with its margins, comments and string literals blanked, so only code
 // is left at the same offsets. A literal's suffix (`'01'B`, `'C1'X`) goes too.
 /**

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { Language, Parser, Query } from "web-tree-sitter";
 /** @typedef {import("web-tree-sitter").Node} Node */
 /** @typedef {import("web-tree-sitter").Point} Point */
-import { blankMargins } from "./source.js";
+import { blankMargins, db2Operators } from "./source.js";
 
 /** @typedef {"pli" | "jcl" | "hlasm" | "db2"} HighlightLanguage */
 /** @typedef {{ parser: Parser, query: Query }} Grammar */
@@ -145,7 +145,7 @@ export function highlight(highlighter, language, text) {
   // The style of every UTF-16 position, which is how tree-sitter counts
   // positions in a JavaScript string and VS Code counts characters.
   const styles = new Uint8Array(text.length);
-  const parsed = language === "pli" || language === "hlasm" ? blankMargins(text, language) : text;
+  const parsed = language === "pli" ? db2Operators(blankMargins(text, language)) : language === "hlasm" ? blankMargins(text, language) : text;
   const tree = highlighter[language].parser.parse(parsed);
   if (!tree) return { tokens: [], errors: [] };
   paint(styles, highlighter[language].query, tree.rootNode, 0);
