@@ -915,6 +915,9 @@ so on them only the silent gaps apply.
 - `PLG100W` An open file has syntax the grammar does not read: each place is
   a warning in the editor and the Problems view, and the log gets one line
   whenever a file's count changes.
+- `PLG101I` A sync read COBOL members (DCLGEN output, copybooks) among the
+  PL/I ones; they are in the `files` table with language `cobol` and no
+  facts, and their syntax is not counted as errors.
 
 The graph page's own codes: `VIZ-101` the id in the URL is not in the graph,
 `VIZ-102` a view could not be drawn, `VIZ-103` the details, `VIZ-104` the

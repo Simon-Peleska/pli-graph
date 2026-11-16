@@ -307,7 +307,10 @@ function highlighting(grammars) {
       try {
         const builder = new vscode.SemanticTokensBuilder(SEMANTIC_LEGEND);
         const language = /** @type {import("./highlight.js").HighlightLanguage} */ (document.languageId);
-        const { tokens, errors } = highlight(highlighter, language, document.getText());
+        const { tokens, errors: found } = highlight(highlighter, language, document.getText());
+        // A COBOL member read as PL/I is all errors; the sync does not count them either.
+        const where = locate(document.uri);
+        const errors = where?.workspace.graph?.module(where.path)?.language === "cobol" ? [] : found;
         for (const token of tokens) {
           builder.push(token.line, token.char, token.length, token.type, token.modifiers);
         }
@@ -454,6 +457,9 @@ function startWorker(context) {
       log.warn(
         `[PLG023W] ${e.path}:${e.line}: ${e.count} syntax error${e.count > 1 ? "s" : ""} the grammar does not know; facts there may be missing: ${e.places.join("; ")}${more}`,
       );
+    }
+    if (result.cobol) {
+      log.info(`[PLG101I] ${workspace.folder.name}: ${result.cobol} of ${result.changed} files read are COBOL, which has no grammar here; they are in the graph's files table (language 'cobol') without facts.`);
     }
     if (result.syntaxErrors.length) {
       log.warn(`[PLG023W] ${workspace.folder.name}: ${result.syntaxErrors.length} of ${result.changed} files read have syntax the grammar does not know. The graph's files table lists them (syntax_errors, error_line).`);
@@ -623,7 +629,7 @@ function claimMember(document) {
   }
   const where = locate(document.uri);
   const module = where?.workspace.graph?.module(where.path);
-  if (!where || !module) {
+  if (!where || !module || module.language === "cobol") {
     return;
   }
   log.info(`${where.path} is a ${module.language} module in the graph, switching its language`);

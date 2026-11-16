@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { DatabaseSync } from "node:sqlite";
 import { Language, Parser } from "web-tree-sitter";
-import { GENERATED, MAIN_OPTIONS, PLI_BUILTINS, blankMargins, db2Operators, languageOf, sqlOperation } from "./source.js";
+import { GENERATED, MAIN_OPTIONS, PLI_BUILTINS, blankMargins, db2Operators, languageOf, pliCode, sqlOperation } from "./source.js";
 import { mfsFields } from "./mfs.js";
 import { syntaxErrorNodes, syntaxErrorText } from "./highlight.js";
 
@@ -299,6 +299,7 @@ import { syntaxErrorNodes, syntaxErrorText } from "./highlight.js";
  * @property {number} resolved accesses linked to the variable they name
  * @property {number} resolveMs
  * @property {Failure[]} failures files whose facts are missing or incomplete
+ * @property {number} cobol COBOL members read, which are in the graph without facts
  * @property {{ path: string, count: number, line: number, places: string[] }[]} syntaxErrors files read in this sync with syntax the grammar does not know: how often, from which line, and the first few places
  */
 
@@ -817,6 +818,7 @@ export async function sync(db, root, indexer, options = {}) {
   const failures = [];
   /** @type {SyncResult["syntaxErrors"]} */
   const syntaxErrors = [];
+  let cobol = 0;
   const fresh = !options.paths && known.size === 0;
   // Parsing is most of a sync's time and needs no database, so many files
   // go to threads while this one writes. A few are faster here than
@@ -951,6 +953,7 @@ export async function sync(db, root, indexer, options = {}) {
         }
         const { language, parsed } = parse;
         file = Number(insertFile.run(path, language, memberOf(path), stat.mtime, stat.size, parsed.syntaxErrors, parsed.errorLine, null).lastInsertRowid);
+        if (language === "cobol") cobol++;
         if (parsed.syntaxErrors > 0) syntaxErrors.push({ path, count: parsed.syntaxErrors, line: parsed.errorLine ?? 0, places: parsed.errorPlaces });
         /** @type {number[]} */
         const symbolIds = [];
@@ -1133,6 +1136,7 @@ export async function sync(db, root, indexer, options = {}) {
       resolveMs: Math.round(performance.now() - linkedAt),
       failures,
       syntaxErrors,
+      cobol,
     };
   } catch (error) {
     db.exec("ROLLBACK");
@@ -1144,7 +1148,7 @@ export async function sync(db, root, indexer, options = {}) {
 }
 
 /**
- * @typedef {{ language: keyof Grammars, parsed: ParsedFile }} Parse
+ * @typedef {{ language: keyof Grammars | "cobol", parsed: ParsedFile }} Parse
  * @typedef {Parse | { error: string, code?: "PLG025E" }} ParseReply
  */
 
@@ -1159,6 +1163,9 @@ export function readAndParse(indexer, root, path) {
   const text = readFileSync(join(root, path), "utf-8");
   let language = /** @type {keyof Grammars} */ (languageOf(path));
   if (language === "pli" && IMS_GEN.test(text.slice(0, 4000))) language = "hlasm";
+  // COBOL members (DCLGEN output, copybooks) can sit among the PL/I ones;
+  // there is no grammar for them, so they are in the graph without facts.
+  if (language === "pli" && isCobol(text)) return { language: "cobol", parsed: parseFile(indexer, "cobol", text) };
   return { language, parsed: parseFile(indexer, language, text) };
 }
 
@@ -1245,13 +1252,14 @@ function memberOf(path) {
 
 /**
  * @param {Indexer} indexer
- * @param {keyof Grammars} language
+ * @param {keyof Grammars | "cobol"} language
  * @param {string} text
  * @returns {ParsedFile}
  */
 function parseFile(indexer, language, text) {
   /** @type {ParsedFile} */
   const file = { symbols: [], refs: [], variables: [], steps: [], dds: [], fileIo: [], sqlColumns: [], columns: [], pcbs: [], sensegs: [], segments: [], segmentFields: [], dliCalls: [], mfsFields: [], statements: [], accesses: [], comparisons: [], literals: [], syntaxErrors: 0, errorLine: null, errorPlaces: [] };
+  if (language === "cobol") return file;
   const tree = indexer[language].parse(language === "pli" ? db2Operators(blankMargins(text, language)) : language === "hlasm" ? blankMargins(text, language) : text);
   if (!tree) return file;
   try {
@@ -2147,6 +2155,17 @@ function firstWord(node) {
   return undefined;
 }
 
+// COBOL's own words, looked for in code with comments and strings blanked:
+// a PL/I comment about a COBOL original is no COBOL.
+const COBOL = [/\b(?:IDENTIFICATION|ID|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\s*\./i, /\bEND-EXEC\s*\./i, /^.{0,11}\b(?:0?[1-9]|[1-4][0-9])\s+[A-Z0-9-]+\s+PIC(?:TURE)?\s+(?:IS\s+)?[AXSV9Z][-+$*/.,()0-9ABEGNPSVXZ]*(?:\s*\.|\s+(?:VALUE|COMP|USAGE|BINARY|PACKED))/im];
+/** A word must be COBOL's both in the text and in its code, else a comment and a blanked PL/I picture could add up. @param {string} text */
+function isCobol(text) {
+  const hits = COBOL.filter((pattern) => pattern.test(text));
+  if (hits.length === 0) return false;
+  // A COBOL comment line (`*` or `/` in column 7) with an apostrophe would open a PL/I string.
+  const code = pliCode(text.replace(/^.{6}[*/].*$/gm, (line) => " ".repeat(line.length)));
+  return hits.some((pattern) => pattern.test(code));
+}
 // A PSB gen, DBD gen or IMS system definition: assembler macros whose first
 // statement says what they are. Their members are rarely named like MFS.
 const IMS_GEN = /^(?:[ \t]*\n|\*.*\n)*\S*[ \t]+(PRINT|TITLE|PCB|PSBGEN|DBD|DATASET|SEGM|IMSCTRL|APPLCTN|TRANSACT|DATABASE)[ \t]/;

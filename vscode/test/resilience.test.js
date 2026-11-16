@@ -133,3 +133,33 @@ test("a changed include re-matches the accesses of the unchanged files using it,
   await sync(db, root, indexer, { paths: ["KDMAIN"] });
   assert.deepEqual(matched(), [{ name: "KD_ART", line: 2 }, { name: "KD_NR", line: 3 }]);
 });
+
+test("COBOL among the members is in the graph without facts, and Db2 written the PL/I way in SQL parses", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-odd-"));
+  writeFileSync(
+    join(root, "KUR4200C"),
+    "      ******************************************************************\n      * DCLGEN TABLE(KUT01200)                                         *\n      * ... IS THE DCLGEN COMMAND THAT MADE THE FOLLOWING STATEMENTS   *\n      * DON'T EDIT                                                     *\n      ******************************************************************\n           EXEC SQL DECLARE KUT01200 TABLE\n           ( AUFTRAGID CHAR(10) NOT NULL ) END-EXEC.\n       01  DCLKUT01200.\n           10 AUFTRAGID            PIC X(10).\n",
+  );
+  writeFileSync(join(root, "KURCOPY"), "      * CUSTOMER'S RECORD\n       01  CUST-REC.\n           10 CUST-NAME            PIC X(30).\n");
+  // PL/I that talks about COBOL, or writes its picture in double quotes, is still PL/I.
+  writeFileSync(join(root, "KURPLI"), " KURPLI: PROC; /* as in the COBOL original: EXEC SQL ... END-EXEC. */\n   DCL 1 S, 5 X PIC \"99\";\n END KURPLI;\n");
+  writeFileSync(
+    join(root, "KURPORT"),
+    " /* ported from the COBOL PROCEDURE DIVISION. of KUR01 */\n KURPORT: PROC OPTIONS(MAIN);\n   DCL 01 REC,\n         05 NAME PIC '(20)X',\n         05 NUM  PIC '999';\n END KURPORT;\n",
+  );
+  writeFileSync(join(root, "KURSQL"), " KURSQL: PROC;\n   EXEC SQL SELECT ' '!!A INTO :X FROM KUT01200 WHERE ALT_PROVIDER ^= 'A';\n END KURSQL;\n");
+  const db = openGraph(join(root, ".graph.sqlite"));
+  const result = await sync(db, root, indexer);
+  assert.equal(result.cobol, 2);
+  assert.deepEqual(result.syntaxErrors, []);
+  assert.deepEqual(
+    db.prepare("SELECT f.path, f.language, (SELECT count(*) FROM refs r WHERE r.file = f.id AND r.kind = 'table') AS tables FROM files f ORDER BY path").all().map((r) => ({ ...r })),
+    [
+      { path: "KUR4200C", language: "cobol", tables: 0 },
+      { path: "KURCOPY", language: "cobol", tables: 0 },
+      { path: "KURPLI", language: "pli", tables: 0 },
+      { path: "KURPORT", language: "pli", tables: 0 },
+      { path: "KURSQL", language: "pli", tables: 1 },
+    ],
+  );
+});

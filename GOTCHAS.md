@@ -49,6 +49,16 @@
   highlighting and Generate JavaScript. Format Document does not, so it
   still refuses such a file (`PLG039W`). The statement text the graph shows
   is the original; generated SQL has the Db2 spelling.
+- **COBOL members are told by their content.** A member whose name says PL/I
+  but which has a `DIVISION.`, an `END-EXEC.` or a COBOL picture
+  (`05 X PIC X(10).`; PL/I's is quoted) gets language `cobol` in `files`
+  and no facts (`PLG101I`), nor syntax warnings in the editor. The same word
+  must also be in the code with comments and strings blanked (`pliCode`,
+  plus COBOL's column-7 comment lines), so a PL/I comment about the COBOL
+  original does not count. There is no COBOL grammar. A member that is
+  COBOL without any of these (only comments, say) is still read as PL/I.
+  The editor learns a member is COBOL from the graph, so one opened before
+  the first sync shows its syntax warnings until then.
 - **Tables and screens resolve by name.** Two DDL files defining `CUSTOMER`
   both get the link; a schema only narrows it when one of them matches. A
   PL/I string literal that happens to equal a format or message name links
