@@ -18,11 +18,11 @@
     },
     {
       "name": "entity.name.function.pli",
-      "match": "(?i)^\\s*([A-Z_@#$][A-Z0-9_@#$]*)\\s*(?=:\\s*(PROC|PROCEDURE|PACKAGE|ENTRY)\\b)"
+      "match": "(?i)^\\s*([A-Z_@#$§ÄÖÜäöüß][A-Z0-9_@#$§ÄÖÜäöüß]*)\\s*(?=:\\s*(PROC|PROCEDURE|PACKAGE|ENTRY)\\b)"
     },
     {
       "name": "entity.name.label.pli",
-      "match": "(?i)^\\s*[A-Z_@#$][A-Z0-9_@#$]*\\s*(?=:(?!=))"
+      "match": "(?i)^\\s*[A-Z_@#$§ÄÖÜäöüß][A-Z0-9_@#$§ÄÖÜäöüß]*\\s*(?=:(?!=))"
     },
     {
       "name": "keyword.control.pli",

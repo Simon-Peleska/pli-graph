@@ -311,7 +311,7 @@ import { syntaxErrorNodes, syntaxErrorText } from "./highlight.js";
  */
 
 // Raise it whenever the indexer reads something new; graphs of an older one are read again.
-const INDEXER_VERSION = 29;
+const INDEXER_VERSION = 30;
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
@@ -1447,6 +1447,8 @@ function readPli(root, file, db2) {
   const accessed = new Set();
   /** @type {{ line: number, endLine: number, text: string, trailing: boolean }[]} trailing: after code on its line */
   const comments = [];
+  /** @type {{ caller: number, name: string, node: Node }[]} built-in function calls, which may call a procedure of the same name */
+  const builtinCalls = [];
   // Depth first, carrying the innermost procedure or package (the caller),
   // the innermost definition (the parent of a nested one), the innermost
   // statement and, for a statement, its branch of an IF and its label.
@@ -1531,6 +1533,7 @@ function readPli(root, file, db2) {
         break;
       }
       case "declare_statement":
+      case "declaration_fragment":
         readDeclaration(node, file, caller, parameters.get(caller) ?? []);
         statement = -1;
         break;
@@ -1592,7 +1595,8 @@ function readPli(root, file, db2) {
       case "call_statement":
       case "fetch_statement": {
         const entry = node.childForFieldName("entry");
-        const name = entry && referenceName(entry);
+        // A procedure can be named like a built-in function (TRIM: PROC), and only a procedure is called.
+        const name = entry && (referenceName(entry) ?? entry.namedChildren.find((c) => c?.type === "builtin_name")?.text.toUpperCase());
         if (entry && name) addRef(file, caller, node.type === "call_statement" ? "call" : "fetch", name, entry);
         if (name) file.statements[statement].detail = name;
         if (name && DLI_ENTRIES.has(name)) {
@@ -1617,6 +1621,8 @@ function readPli(root, file, db2) {
         if (!isCallEntry && !isAssigned && node.children.some((c) => c?.type === "argument" || c?.type === "(")) {
           const name = referenceName(node);
           if (name) addRef(file, caller, "invoke", name, node);
+          const builtin = node.namedChildren.find((c) => c?.type === "builtin_name");
+          if (!name && builtin) builtinCalls.push({ caller, name: builtin.text.toUpperCase(), node });
         }
         if (statement < 0 || isCallEntry || !up) break;
         const access = readAccess(text, node, up, file.statements[statement].kind);
@@ -1660,6 +1666,11 @@ function readPli(root, file, db2) {
       stack.push({ node: child, caller, parent, statement, branch, label });
     }
   }
+  // An internal procedure named like a built-in (TRIM: PROC) hides it, so `TRIM(X)` calls the procedure.
+  const procedures = new Set(file.symbols.filter((s) => s.kind === "procedure").map((s) => s.name));
+  // A wrapper `TRIM: PROC; DCL TRIM BUILTIN; ... TRIM(X)` calls the built-in again.
+  const builtins = new Set(file.variables.filter((v) => v.type === "BUILTIN").map((v) => `${v.scope} ${v.name}`));
+  for (const call of builtinCalls) if (procedures.has(call.name) && !builtins.has(`${call.caller} ${call.name}`)) addRef(file, call.caller, "invoke", call.name, call.node);
   // A parameter left undeclared has PL/I's default attributes. An ENTRY's
   // parameters are declared in its procedure: each gets a copy in the entry.
   const declared = new Map(file.variables.filter((v) => v.level === 1).map((v) => [`${v.scope} ${v.name}`, v]));
@@ -1883,9 +1894,15 @@ function readDeclaration(statement, file, scope, parameters) {
   const structure = [];
   /** @type {Set<number>} positions in file.variables whose type is only the default */
   const defaulted = new Set();
+  let levelled = false;
   for (const item of statement.namedChildren) {
+    // `DCL 1 REC, %INCLUDE FIELDS;`: a levelled item with no type of its own before an include is a structure whose
+    // members come from there. `DCL I, %INCLUDE MORE;` only continues the list.
+    const last = structure.length ? structure[structure.length - 1] : -1;
+    if (item?.type === "preprocessor_include" && levelled && last >= 0 && (defaulted.delete(last) || file.variables[last].type === null)) Object.assign(file.variables[last], { type: "STRUCTURE", size: null });
     if (item?.type !== "declaration_item") continue;
     const levelNode = item.childForFieldName("level");
+    levelled = levelNode !== null;
     const level = levelNode ? Number(levelNode.text) : 1;
     const nameNode = item.childForFieldName("name");
     const shared = item.namedChildren.filter((c) => c !== null && c.id !== levelNode?.id && c.id !== nameNode?.id);

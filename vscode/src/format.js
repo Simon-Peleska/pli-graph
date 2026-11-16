@@ -53,8 +53,12 @@ export function format(language, text, options) {
   return { lines: result };
 }
 
+// ß has no capital in code page 273; toUpperCase would turn it into SS and rename the variable.
+/** @param {string} text */
+const upper = (text) => text.replace(/[^ß]+/g, (s) => s.toUpperCase());
+
 /** @param {string} text @param {Case} how */
-const cased = (text, how) => (how === "upper" ? text.toUpperCase() : how === "lower" ? text.toLowerCase() : text);
+const cased = (text, how) => (how === "upper" ? upper(text) : how === "lower" ? text.toLowerCase() : text);
 
 // What JCL, assembler and SQL say, whatever their blanks and case. JCL
 // statements join and split, so their lines' // come and go.
@@ -444,7 +448,7 @@ function formatPli(lines, code, { indent, pli, keywordCase, identifierCase, abbr
       const inner = children.map(isStatement).lastIndexOf(true);
       if (inner < 0) return void emit([...prefix, ...tokensOf(children)], col);
       unit([...prefix, ...tokensOf(children.slice(0, inner))], children[inner], col);
-    } else if (node.type === "declare_statement" || (node.type === "define_statement" && children.some((c) => c.type === "declaration_item"))) {
+    } else if (node.type === "declare_statement" || node.type === "declaration_fragment" || (node.type === "define_statement" && children.some((c) => c.type === "declaration_item"))) {
       declare(children, col, prefix);
     } else if (node.type === "exec_statement" && /^EXEC\s+SQL\b/i.test(node.text)) {
       execSql(node, col, prefix);
@@ -489,7 +493,7 @@ function formatPli(lines, code, { indent, pli, keywordCase, identifierCase, abbr
     // The first item goes after DCL, the others under it; a structure's
     // members under its level-1 name, 2 further in per level.
     const lead = [...prefix, ...tokensOf(children.slice(0, children.indexOf(items[0])))];
-    const first = col + lead.map((t, i) => (i && t.space ? " " : "") + t.text).join("").length + 1;
+    const first = !lead.length ? col : col + lead.map((t, i) => (i && t.space ? " " : "") + t.text).join("").length + 1;
     /** @type {number[]} */
     const levels = [];
     let nameColumn = first;
@@ -504,6 +508,8 @@ function formatPli(lines, code, { indent, pli, keywordCase, identifierCase, abbr
         if (depth === 0) nameColumn = first + (levelNode ? levelNode.text.length + 1 : 0);
         if (child.id !== items[0].id) tokens[at].newline = depth === 0 ? first : nameColumn + 2 * (depth - 1);
       }
+      // An include brings members of the structure it is in.
+      if (child.type === "preprocessor_include") tokens[at].newline = levels.length ? nameColumn + 2 * (levels.length - 1) : first;
       at += tokensOf([child]).length;
     }
     out.push(...fill(tokens, col, indent, PLI_LIMIT));
@@ -583,7 +589,7 @@ function samePli(before, after, pli) {
       else if ((type === "string_literal" || type.endsWith("_literal")) && m) words.push(`'${m[2].replaceAll(m[1] + m[1], m[1])}'${m[3].toUpperCase()}`);
       else if (type === "identifier" && leaf.parent?.type === "end_statement") continue;
       else if (leaf.parent?.type === "condition_name" || (!leaf.isNamed && /^[a-z]/i.test(type))) words.push(...(LONG.get(text.toUpperCase()) ?? text.toUpperCase()).split(" "));
-      else words.push(text.toUpperCase().replace(/¬/g, "^").replace(/!/g, "|"));
+      else words.push(upper(text).replace(/¬/g, "^").replace(/!/g, "|"));
     }
     tree.delete();
     return words.join("\n");
@@ -659,7 +665,7 @@ const ISOLATION = new Set(["UR", "CS", "RS", "RR"]);
 function sqlTokens(text, row, column, style) {
   /** @type {Token[]} */
   const tokens = [];
-  const pattern = /(\s+)|(--[^\n]*|\/\*[\s\S]*?\*\/)|('(?:[^']|'')*'?|"(?:[^"]|"")*"?)|([A-Za-z0-9_@#$.]+)|(<>|<=|>=|¬=|\^=|!=|\|\||\S)/g;
+  const pattern = /(\s+)|(--[^\n]*|\/\*[\s\S]*?\*\/)|('(?:[^']|'')*'?|"(?:[^"]|"")*"?)|([A-Za-z0-9_@#$§ÄÖÜäöüß.]+)|(<>|<=|>=|¬=|\^=|!=|\|\||\S)/g;
   let previousEnd = -1;
   let r = row;
   let lineStart = -column;
@@ -679,14 +685,14 @@ function sqlTokens(text, row, column, style) {
   for (let i = 1; i < tokens.length; i++) {
     const t = tokens[i];
     const a = tokens[i - 1];
-    const word = /^[A-Za-z0-9_@#$'"]/.test(a.text);
+    const word = /^[A-Za-z0-9_@#$§ÄÖÜäöüß'"]/.test(a.text);
     let space = true;
     if ([",", ";", ")"].includes(t.text) || a.text === "(") space = false;
     else if (a.text === ":" || t.text === "." || a.text === ".") space = t.space;
     else if (t.text === "(" && (word || a.text === ")")) space = t.space;
     else if (t.text === ":" && !t.space) space = false;
     else if (a.text === "," && !t.space && /^\d/.test(t.text) && /^\d/.test(tokens[i - 2]?.text ?? "")) space = false;
-    else if ((a.text === "-" || a.text === "+") && !t.space && !/^[A-Za-z0-9_@#$)'"]/.test(tokens[i - 2]?.text ?? "(")) space = false;
+    else if ((a.text === "-" || a.text === "+") && !t.space && !/^[A-Za-z0-9_@#$§ÄÖÜäöüß)'"]/.test(tokens[i - 2]?.text ?? "(")) space = false;
     if (!t.comment) t.space = space;
     t.prio = a.text === "," || ["AND", "OR"].includes(t.text.toUpperCase()) ? 3 : space ? 1 : 0;
   }

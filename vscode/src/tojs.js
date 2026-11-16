@@ -828,7 +828,8 @@ function programToJs(db, root, indexer, path) {
     const args = named.flatMap((c) => (c.type === "argument" && c.namedChildren[0] ? [c.namedChildren[0]] : []));
     const v = variableAt(names.join("."), at);
     const isVariable = v && v.type !== "BUILTIN" && (args.length === 0 || v.dims);
-    if (builtinName && !isVariable) return builtin(builtinName.text.toUpperCase(), args, node, at);
+    // An internal procedure named like a built-in (TRIM: PROC) hides it.
+    if (builtinName && !isVariable && !procedureNames.has(builtinName.text.toUpperCase())) return builtin(builtinName.text.toUpperCase(), args, node, at);
     if (node.text.includes("->")) return todoExpr(node, "a pointer-qualified reference", at);
     if (v?.type === "BUILTIN") return builtin(names[0], args, node, at);
     if (v && v.type === "ENTRY") {
@@ -1503,7 +1504,7 @@ function programToJs(db, root, indexer, path) {
   /** @param {Node} node a call_statement @param {number} depth @param {At} at */
   const call = (node, depth, at) => {
     const entry = node.childForFieldName("entry");
-    const name = entry?.namedChildren.find((c) => c?.type === "identifier")?.text.toUpperCase() ?? "";
+    const name = entry?.namedChildren.find((c) => c?.type === "identifier" || c?.type === "builtin_name")?.text.toUpperCase() ?? "";
     const args = node.namedChildren.find((c) => c?.type === "argument_list")?.namedChildren.filter((c) => c?.type === "argument") ?? [];
     const d = dli.get(`${current.id}:${at.line}`);
     if (d) {
@@ -1928,37 +1929,63 @@ function programToJs(db, root, indexer, path) {
   /** @param {Node} node a select_statement @param {number} depth @param {At} at */
   const select = (node, depth, at) => {
     const named = /** @type {Node[]} */ (node.namedChildren.filter((c) => c !== null));
-    const subjectNode = named.find((c) => c.type !== "when_clause" && c.type !== "otherwise_clause" && c.type !== "end_statement" && c.type !== "comment");
+    const subjectNode = named.find((c) => !["when_clause", "otherwise_clause", "end_statement", "comment", "preprocessor_include"].includes(c.type));
     const subject = subjectNode && expr(subjectNode, at);
-    let first = true;
-    for (const clause of named) {
-      if (clause.type === "when_clause") {
-        const parts = /** @type {Node[]} */ (clause.namedChildren.filter((c) => c !== null && c.type !== "comment"));
-        const action = /** @type {Node} */ (parts.pop());
-        const tests = parts.map((p) => {
-          const value = expr(p, at);
-          if (!subject) return value.code;
-          const padded = value.kind === "literal" && subject.v && subject.kind === "char" && value.text !== undefined ? JSON.stringify(value.text.padEnd(charLength(subject.v))) : value.code;
-          return `${subject.code} === ${padded}`;
-        });
-        emit(depth, `${first ? "if" : "} else if"} (${tests.join(" || ")}) {`);
-        if (action.type === "null_statement") emit(depth + 1, "// nothing to do");
-        else body(action, depth + 1, at);
-        first = false;
-      } else if (clause.type === "otherwise_clause") {
-        const action = clause.namedChildren.find((c) => c !== null && c.type !== "comment");
-        const comments = clause.namedChildren.some((c) => c?.type === "comment");
-        if (!first && (!action || action.type === "null_statement") && !comments) return emit(depth, "}");
-        emit(depth, first ? "{" : "} else {");
-        if (action) body(action, depth + 1, at);
-        emit(depth, "}");
-        return;
+    // An include among the WHENs brings more of them; they are translated in place, from their own file.
+    const included = db.prepare(`SELECT l.target_file FROM refs r JOIN links l ON l.ref = r.id WHERE r.file = ? AND r.kind = 'include' AND r.line = ?`);
+    /** @param {Node} clause @param {{ id: number, path: string }} file @param {Set<number>} seen @returns {{ clause: Node, file: { id: number, path: string }, cycle?: boolean }[]} */
+    const expand = (clause, file, seen) => {
+      if (clause.type === "comment") return [];
+      if (clause.type !== "preprocessor_include") return [{ clause, file }];
+      const target = /** @type {{ target_file: number } | undefined} */ (included.get(file.id, lineOf(clause)));
+      const include = target && includeTrees.get(target.target_file);
+      if (target && seen.has(target.target_file)) return [{ clause, file, cycle: true }];
+      if (!target || !include?.tree) return [{ clause, file }];
+      const inner = { id: target.target_file, path: include.path };
+      const children = /** @type {Node[]} */ (include.tree.rootNode.namedChildren.filter((c) => c !== null));
+      return children.flatMap((c) => expand(c, inner, new Set([...seen, inner.id])));
+    };
+    const clauses = named.flatMap((clause) => expand(clause, current, new Set([current.id])));
+    const outer = current;
+    try {
+      let first = true;
+      for (const { clause, file, cycle } of clauses) {
+        current = file;
+        const here = file === outer ? at : { ...at, line: lineOf(clause) };
+        if (cycle) todoStatement(clause, depth, "an include among the WHENs that includes itself");
+        else if (clause.type === "preprocessor_include") todoStatement(clause, depth, "an include among the WHENs that is not in the graph");
+        else if (file !== outer && clause.type !== "when_clause" && clause.type !== "otherwise_clause") todoStatement(clause, depth, "something other than a WHEN in an include among the WHENs");
+        if (clause.type === "when_clause") {
+          const parts = /** @type {Node[]} */ (clause.namedChildren.filter((c) => c !== null && c.type !== "comment"));
+          const action = /** @type {Node} */ (parts.pop());
+          const tests = parts.map((p) => {
+            const value = expr(p, here);
+            if (!subject) return value.code;
+            const padded = value.kind === "literal" && subject.v && subject.kind === "char" && value.text !== undefined ? JSON.stringify(value.text.padEnd(charLength(subject.v))) : value.code;
+            return `${subject.code} === ${padded}`;
+          });
+          emit(depth, `${first ? "if" : "} else if"} (${tests.join(" || ")}) {`);
+          if (action.type === "null_statement") emit(depth + 1, "// nothing to do");
+          else body(action, depth + 1, here);
+          first = false;
+        } else if (clause.type === "otherwise_clause") {
+          const action = clause.namedChildren.find((c) => c !== null && c.type !== "comment");
+          const comments = clause.namedChildren.some((c) => c?.type === "comment");
+          if (!first && (!action || action.type === "null_statement") && !comments) return emit(depth, "}");
+          emit(depth, first ? "{" : "} else {");
+          if (action) body(action, depth + 1, here);
+          emit(depth, "}");
+          return;
+        }
       }
+      current = outer;
+      if (first) return emit(depth, `noWhen(${JSON.stringify(`${path}:${at.line}`)});`);
+      emit(depth, "} else {");
+      emit(depth + 1, `noWhen(${JSON.stringify(`${path}:${at.line}`)});`);
+      emit(depth, "}");
+    } finally {
+      current = outer;
     }
-    if (first) return emit(depth, `noWhen(${JSON.stringify(`${path}:${at.line}`)});`);
-    emit(depth, "} else {");
-    emit(depth + 1, `noWhen(${JSON.stringify(`${path}:${at.line}`)});`);
-    emit(depth, "}");
   };
 
   /** The data fields of a structure. @param {Variable} v */
@@ -2337,7 +2364,7 @@ function programToJs(db, root, indexer, path) {
           db.prepare(`SELECT l.target_file FROM refs r JOIN links l ON l.ref = r.id WHERE r.file = ? AND r.kind = 'include' AND r.line = ?`).get(current.id, at.line)
         );
         const include = target && includeTrees.get(target.target_file);
-        const code = include?.tree?.rootNode.namedChildren.filter((c) => c && c.type !== "comment" && c.type !== "declare_statement") ?? [];
+        const code = include?.tree?.rootNode.namedChildren.filter((c) => c && c.type !== "comment" && c.type !== "declare_statement" && c.type !== "declaration_fragment") ?? [];
         // An include of only declarations is the import and the declarations at the top.
         if (!target || !include?.tree || !code.length || expanding.has(target.target_file)) return;
         emit(depth, `// ${text}: its statements`);

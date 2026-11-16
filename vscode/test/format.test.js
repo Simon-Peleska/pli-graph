@@ -372,3 +372,12 @@ test("formatting the test sources keeps their meaning and twice is like once", (
     }
   }
 });
+
+test("PL/I: an include inside a structure stands where its members go, and an include member that is part of a structure is laid out as one", () => {
+  assert.deepEqual(formatted("pli", [" P: PROC;", " DCL 1 REC, %INCLUDE KURRECF;", " 2 B CHAR(1);", " END P;"]), [" P: PROC;", "    DCL 1 REC,", "          %INCLUDE KURRECF;", "          2 B CHAR(1);", " END P;"]);
+  assert.deepEqual(formatted("pli", [" 2 NAME CHAR(10), 2 X, 3 Y FIXED BIN(31),"]), [" 2 NAME CHAR(10),", " 2 X,", "   3 Y FIXED BIN(31),"]);
+});
+
+test("PL/I: names with umlauts stay one word, and ß is not turned into SS", () => {
+  assert.deepEqual(formatted("pli", [" P: PROC;", " prüfung=größe-änderung;", " END P;"]), [" P: PROC;", "    PRÜFUNG = GRÖßE - ÄNDERUNG;", " END P;"]);
+});

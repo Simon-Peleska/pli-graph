@@ -1798,3 +1798,48 @@ test("FIXED DEC with decimals stays exact: large sums, comparisons and text of c
   const { ZZP00021 } = await import(pathToFileURL(join(out, "programs/ZZP00021.js")).href);
   assert.equal(await ZZP00021(""), "141993493546.86/GLEICH/3.3/3703702/141993493546.86");
 });
+
+test("WHENs from an include among the WHENs are translated in place, and a procedure named like a built-in is called", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  writeFileSync(
+    join(root, "KURMAIN"),
+    [
+      " KURMAIN: PROC OPTIONS(MAIN);",
+      "   DCL PRÜFUNG CHAR(1);",
+      "   SELECT (PRÜFUNG);",
+      "     WHEN ('A') CALL TRIM;",
+      "     %INCLUDE KURWHEN;",
+      "   END;",
+      "   PRÜFUNG = LOWERCASE(PRÜFUNG);",
+      " TRIM: PROC;",
+      " END TRIM;",
+      " LOWERCASE: PROC(S) RETURNS(CHAR(1));",
+      "   DCL S CHAR(1);",
+      "   RETURN(S);",
+      " END LOWERCASE;",
+      " END KURMAIN;",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(join(root, "KURWHEN"), "     WHEN ('B') CALL TRIM;\n     %INCLUDE KURW2;\n");
+  writeFileSync(join(root, "KURW2"), "     WHEN ('C') CALL TRIM;\n     OTHERWISE PRÜFUNG = 'X';\n");
+  writeFileSync(join(root, "KURJOB.jcl"), "//KURJOB JOB (A)\n//S1 EXEC PGM=KURMAIN\n");
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES });
+  assert.deepEqual(summary.programs.map((p) => p.todos), [[]]);
+  const code = readFileSync(join(out, "programs/KURMAIN.js"), "utf-8");
+  assert.match(code, /if \(PRÜFUNG === "A"\) \{\n\s+TRIM\(\);\n\s+\} else if \(PRÜFUNG === "B"\) \{\n\s+TRIM\(\);\n\s+\} else if \(PRÜFUNG === "C"\) \{\n\s+TRIM\(\);\n\s+\} else \{\n\s+PRÜFUNG = "X";\n\s+\}\n/);
+  assert.match(code, /PRÜFUNG = char\(LOWERCASE\(PRÜFUNG\), 1\);/);
+});
+
+test("an include among the WHENs that includes itself, or brings something other than WHENs, becomes a TODO", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  writeFileSync(join(root, "KURMAIN"), [" KURMAIN: PROC OPTIONS(MAIN);", "   DCL X CHAR(1);", "   SELECT (X);", "     %INCLUDE KURWHEN;", "   END;", " END KURMAIN;", ""].join("\n"));
+  writeFileSync(join(root, "KURWHEN"), "     WHEN ('A') X = 'B';\n     %INCLUDE KURWHEN;\n     X = 'C';\n");
+  writeFileSync(join(root, "KURJOB.jcl"), "//KURJOB JOB (A)\n//S1 EXEC PGM=KURMAIN\n");
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES });
+  const todos = summary.programs[0].todos;
+  assert.equal(todos.length, 2, JSON.stringify(todos));
+  assert.match(JSON.stringify(todos), /includes itself.*something other than a WHEN/);
+});

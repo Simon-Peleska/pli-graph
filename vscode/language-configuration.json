@@ -3,5 +3,5 @@
   "brackets": [["(", ")"]],
   "autoClosingPairs": [["(", ")"], ["'", "'"], ["\"", "\""], { "open": "/*", "close": " */" }],
   "surroundingPairs": [["(", ")"], ["'", "'"], ["\"", "\""]],
-  "wordPattern": "[A-Za-z0-9_@#$]+"
+  "wordPattern": "[A-Za-z0-9_@#$§ÄÖÜäöüß]+"
 }

@@ -713,7 +713,7 @@ const targetPlace = (t) => ({ path: t.path, line: t.line - 1, col: t.col ?? 0, e
  * @returns {{ word: string, range: vscode.Range, places: Place[], how: string } | undefined}
  */
 function definitionsAt(document, position) {
-  const range = document.getWordRangeAtPosition(position, /[A-Za-z0-9_@#$]+/);
+  const range = document.getWordRangeAtPosition(position, /[A-Za-z0-9_@#$§ÄÖÜäöüß]+/);
   const where = locate(document.uri);
   const graph = where?.workspace.graph;
   if (!range || !where || !graph) {
@@ -1159,7 +1159,7 @@ function showDescribe(context, key) {
   const shown = workspaceShown();
   if (!shown) return;
   if (key) return openDescribe(context, shown.workspace, key);
-  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$]+/);
+  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$§ÄÖÜäöüß]+/);
   /** @type {vscode.QuickPick<vscode.QuickPickItem & { key: string }>} */
   const pick = vscode.window.createQuickPick();
   pick.placeholder = "Describe the subject named… (a program, procedure, field, table, column, segment, job, dataset, screen…)";
@@ -1208,7 +1208,7 @@ function showFlow(context, workspace, procedure) {
 function showDataFlow(context, id) {
   const shown = workspaceShown();
   if (!shown) return;
-  const word = shown.editor && shown.where && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$]+/);
+  const word = shown.editor && shown.where && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$§ÄÖÜäöüß]+/);
   const variable = id ?? (word && shown.where ? shown.graph.variableAt(shown.where.path, word.start.line + 1, shown.editor?.document.getText(word) ?? "") : undefined);
   if (!variable) {
     const message = `[PLG038E] There is no variable at the cursor to show the data flow of${shown.where ? ` in ${shown.where.path}` : ": no PL/I file is open"}.`;
@@ -1246,7 +1246,7 @@ function showDataModel(context, uri) {
 function showTransactions(context) {
   const shown = workspaceShown();
   if (!shown) return;
-  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$]+/);
+  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$§ÄÖÜäöüß]+/);
   const candidates = [word && shown.editor?.document.getText(word).toUpperCase(), shown.where?.path.split("/").pop()?.replace(/\.[^.]*$/, "").toUpperCase()];
   const name =
     candidates.find(
@@ -1348,7 +1348,7 @@ function showMessages(context) {
 function showScreenInput(context) {
   const shown = workspaceShown();
   if (!shown) return;
-  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$]+/);
+  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$§ÄÖÜäöüß]+/);
   const named = word ? shown.editor?.document.getText(word).toUpperCase() ?? "" : "";
   const screen = /** @type {{ name: string } | undefined} */ (
     shown.graph.all(
@@ -1379,7 +1379,7 @@ function showScreenInput(context) {
 function showColumnPath(context) {
   const shown = workspaceShown();
   if (!shown) return;
-  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$]+/);
+  const word = shown.editor && shown.editor.document.getWordRangeAtPosition(shown.editor.selection.active, /[A-Za-z0-9_@#$§ÄÖÜäöüß]+/);
   const named = word ? shown.editor?.document.getText(word).toUpperCase() ?? "" : "";
   const line = (shown.editor?.selection.active.line ?? 0) + 1;
   const column = /** @type {{ table_name: string, name: string } | undefined} */ (

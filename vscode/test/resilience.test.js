@@ -134,6 +134,48 @@ test("a changed include re-matches the accesses of the unchanged files using it,
   assert.deepEqual(matched(), [{ name: "KD_ART", line: 2 }, { name: "KD_NR", line: 3 }]);
 });
 
+test("includes inside a declaration or a SELECT, labels named like built-ins and umlauts in names are read", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-real-"));
+  writeFileSync(
+    join(root, "KURMAIN"),
+    [
+      " KURMAIN: PROC OPTIONS(MAIN);",
+      "   DCL 1 REC,",
+      "       %INCLUDE KURRECF;",
+      "       2 PRÜFUNG CHAR(1);",
+      "   DCL 1 KUT012,",
+      "       %INCLUDE KURSTRD;",
+      "   DCL I, %INCLUDE KURMORE;",
+      "   SELECT (PRÜFUNG);",
+      "     WHEN ('A') CALL TRIM;",
+      "     %INCLUDE KURWHEN;",
+      "     OTHERWISE;",
+      "   END;",
+      "   PRÜFUNG = TRIM(PRÜFUNG);",
+      " TRIM: PROC;",
+      "   DCL TRIM BUILTIN;",
+      "   PRÜFUNG = TRIM(PRÜFUNG);",
+      " END TRIM;",
+      " END KURMAIN;",
+      "",
+    ].join("\n"),
+  );
+  writeFileSync(join(root, "KURRECF"), "       2 NAME CHAR(10),\n");
+  writeFileSync(join(root, "KURSTRD"), "       2 ID CHAR(10);\n");
+  writeFileSync(join(root, "KURWHEN"), "     WHEN ('B') CALL TRIM;\n");
+  writeFileSync(join(root, "KURMORE"), "       1 J FIXED BIN(31);\n");
+  const db = openGraph(join(root, ".graph.sqlite"));
+  const result = await sync(db, root, indexer);
+  assert.deepEqual(result.syntaxErrors, []);
+  const main = "(SELECT id FROM files WHERE path = 'KURMAIN')";
+  assert.deepEqual(db.prepare(`SELECT name FROM refs WHERE file = ${main} AND kind = 'include' ORDER BY line`).all().map((r) => r.name), ["KURRECF", "KURSTRD", "KURMORE", "KURWHEN"]);
+  assert.deepEqual(db.prepare(`SELECT name FROM symbols WHERE file = ${main} AND kind = 'procedure' ORDER BY line`).all().map((r) => r.name), ["KURMAIN", "TRIM"]);
+  assert.deepEqual(db.prepare(`SELECT count(*) AS n FROM links l JOIN refs r ON r.id = l.ref WHERE r.file = ${main} AND r.kind IN ('call', 'invoke') AND r.name = 'TRIM'`).get()?.n, 2);
+  const fields = db.prepare("SELECT f.path, v.name, v.level FROM variables v JOIN files f ON f.id = v.file WHERE f.path IN ('KURRECF', 'KURSTRD') ORDER BY f.path").all();
+  assert.deepEqual(fields.map((r) => `${r.path} ${r.level} ${r.name}`), ["KURRECF 2 NAME", "KURSTRD 2 ID"]);
+  assert.deepEqual(db.prepare(`SELECT name, type FROM variables WHERE file = ${main} AND level = 1 ORDER BY line`).all().map((r) => `${r.name} ${r.type}`), ["REC STRUCTURE", "KUT012 STRUCTURE", "I FIXED BIN", "TRIM BUILTIN"]);
+});
+
 test("COBOL among the members is in the graph without facts, and Db2 written the PL/I way in SQL parses", async () => {
   const root = mkdtempSync(join(tmpdir(), "pli-odd-"));
   writeFileSync(

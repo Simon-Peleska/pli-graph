@@ -158,6 +158,20 @@
   array element look alike, so `F(X)` is a read of `F` too. A `GOTO` label, an `ON`
   condition's file and an I/O statement's `FILE(...)` are no accesses;
   `INTO`, `KEYTO`, `SET` and `GET`'s data are writes.
+- **An include member can be a piece of a structure or of a SELECT.** The
+  grammar reads a member that starts with a level number (`2 NAME CHAR(10),`)
+  or with `WHEN`s as a `declaration_fragment` or loose clauses. Its fields
+  land in `variables` as level-2 rows of the member, not under the
+  includer's structure, so `REC.NAME` does not resolve; `REC` itself is a
+  `STRUCTURE`. A name assigned in such a member but declared in the includer
+  gets an IMPLICIT declaration in the member, like in any include. Generate
+  JavaScript puts the `WHEN`s of an include among the `WHEN`s in place, and
+  nested includes too. A member that continues a DCL list without level
+  numbers (`J FIXED BIN(31);`) is still a syntax error, and so is a member
+  whose first statement assigns a variable named `WHEN`.
+- **`ß` has no capital.** Format Document keeps it, but the graph and
+  Generate JavaScript upper-case names with `toUpperCase()`, so `GRÖßE` is
+  `GRÖSSE` there and the same as a variable spelled `GRÖSSE`.
 - **A comment belongs to what is right below it.** Only comment lines with
   no gap down to a procedure or declaration count (box lines of `*` join the
   block), plus one after a declaration on its line. A comment above a
