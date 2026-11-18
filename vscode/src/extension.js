@@ -517,7 +517,9 @@ function watch(workspace) {
   /** @param {vscode.Uri} uri */
   const report = (uri) => {
     const path = vscode.workspace.asRelativePath(uri, false).replaceAll("\\", "/");
-    if (path.split("/").some((part) => part.startsWith("."))) return;
+    // Generate JavaScript writes thousands of files there; the indexer skips them anyway.
+    const parts = path.split("/");
+    if (parts.some((part) => part.startsWith(".")) || parts[0] === GENERATED) return;
     workspace.changes.add(path);
     syncChanges(workspace);
   };

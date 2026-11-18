@@ -268,6 +268,16 @@
   search's `sql_columns_column_name` index is built the first time an
   existing graph opens: 31 ms for the sample's 92k rows, so about 0.4 s
   at 5M lines.
+- **`r.caller IS s.caller` can pick `refs_caller` and scan every caller-less
+  ref.** For a statement outside any procedure, `r.caller IS s.caller`
+  becomes `caller IS NULL`. On a real repo that matches a huge share of
+  refs, and it is repeated for every row. Generate JavaScript hung on
+  its first program this way: with half the sample's refs caller-less,
+  it took 452 s, against 135 ms when SQLite searches `refs_file` instead
+  (`+r.caller` keeps it off the index). The sample itself has no
+  caller-less refs and no unresolved writes, so it never shows this.
+- **The watcher and the indexer ignore `generated/`,** so editing the
+  generated code by hand does not sync anything.
 
 ## The cgr patch set (`patches/`, no longer used by the extension)
 

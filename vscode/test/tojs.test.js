@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
-import { generateJs } from "../src/tojs.js";
+import { UNRESOLVED_CHANGES, generateJs } from "../src/tojs.js";
 import { indexed, indexer } from "./indexed.js";
 
 const TEMPLATES = { templates: join(import.meta.dirname, "../src/jsruntime"), tn3270: join(import.meta.dirname, "../screen/vendor/tn3270") };
@@ -1842,4 +1842,14 @@ test("an include among the WHENs that includes itself, or brings something other
   const todos = summary.programs[0].todos;
   assert.equal(todos.length, 2, JSON.stringify(todos));
   assert.match(JSON.stringify(todos), /includes itself.*something other than a WHEN/);
+});
+
+test("the unresolved writes look a CALL up by file, never through every caller-less ref", () => {
+  // With refs_caller, a statement outside any procedure scanned every caller-less ref per row: hours on a real repo.
+  const plan = db
+    .prepare(`EXPLAIN QUERY PLAN ${UNRESOLVED_CHANGES}`)
+    .all()
+    .map((row) => String(row.detail));
+  assert.ok(plan.some((step) => step.includes("refs_file")), plan.join("\n"));
+  assert.ok(!plan.some((step) => step.includes("refs_caller")), plan.join("\n"));
 });

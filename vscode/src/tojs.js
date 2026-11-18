@@ -258,9 +258,14 @@ function hostVariables(text) {
   return found;
 }
 
-// The procedure a statement `s` calls, if it is a CALL the graph resolved.
-const CALLEE = `(SELECT l.target_symbol FROM refs r JOIN links l ON l.ref = r.id
-  WHERE r.file = s.file AND r.caller IS s.caller AND r.kind = 'call' AND r.line BETWEEN s.line AND s.end_line LIMIT 1)`;
+// The procedure a statement `s` calls with the access `a`, if it is a CALL the graph resolved.
+// Only a pass needs it. The + keeps SQLite off refs_caller: for a statement outside any
+// procedure that index yields every caller-less ref of the graph, for each row.
+const CALLEE = `CASE WHEN a.mode = 'arg' THEN (SELECT l.target_symbol FROM refs r JOIN links l ON l.ref = r.id
+  WHERE r.file = s.file AND +r.caller IS s.caller AND r.kind = 'call' AND r.line BETWEEN s.line AND s.end_line LIMIT 1) END`;
+
+export const UNRESOLVED_CHANGES = `/* full scan */ SELECT a.name, a.mode, a.position, ${CALLEE} AS callee
+  FROM accesses a JOIN statements s ON s.id = a.statement WHERE a.variable IS NULL AND a.mode != 'read'`;
 
 /** @typedef {{ mode: string, position: number | null, callee: number | null }} Change */
 
@@ -280,10 +285,7 @@ function unresolvedChanges(db) {
   if (known && known.version === version) return known.byName;
   /** @type {Map<string, Change[]>} */
   const byName = new Map();
-  const rows = db.prepare(
-    `/* full scan */ SELECT a.name, a.mode, a.position, ${CALLEE} AS callee
-     FROM accesses a JOIN statements s ON s.id = a.statement WHERE a.variable IS NULL AND a.mode != 'read'`,
-  );
+  const rows = db.prepare(UNRESOLVED_CHANGES);
   for (const row of /** @type {Iterable<Change & { name: string }>} */ (rows.iterate())) {
     const last = row.name.slice(row.name.lastIndexOf(".") + 1).toUpperCase();
     const changes = byName.get(last) ?? [];
@@ -300,9 +302,10 @@ function unresolvedChanges(db) {
  * @param {string} root
  * @param {{ pli: import("web-tree-sitter").Parser }} indexer
  * @param {string} path relative to root
+ * @param {(text: string) => void} [progress] told every few seconds where a long translation is
  * @returns {{ code: string, statements: number, todos: Todo[], calls: string[], includes: Map<string, Map<string, string>> }} calls: the paths of the programs it calls; includes: the factories of each include's initial values, by member and variable
  */
-function programToJs(db, root, indexer, path) {
+function programToJs(db, root, indexer, path, progress = () => {}) {
   const file = /** @type {{ id: number, member: string } | undefined} */ (db.prepare(`SELECT id, member FROM files WHERE path = ?`).get(path));
   if (!file) throw new Error(`[PLG053E] ${path} is not in the graph; index it first`);
   const tree = indexer.pli.parse(db2Operators(blankMargins(readFileSync(join(root, path), "utf-8"), "pli")));
@@ -326,6 +329,8 @@ function programToJs(db, root, indexer, path) {
   for (const f of /** @type {{ id: number, path: string }[]} */ (db.prepare(`SELECT id, path FROM files WHERE id IN (SELECT value FROM json_each(?)) AND language = 'pli'`).all(JSON.stringify(included)))) {
     includeTrees.set(f.id, { path: f.path, tree: indexer.pli.parse(db2Operators(blankMargins(readFileSync(join(root, f.path), "utf-8"), "pli"))) });
   }
+  progress(`parsed ${path} and its ${includeTrees.size} includes`);
+  let lastBeat = Date.now();
   const roots = [tree.rootNode, ...[...includeTrees.values()].flatMap((i) => (i.tree ? [i.tree.rootNode] : []))];
   /** @param {string} type */
   const allOfType = (type) => roots.flatMap((r) => r.descendantsOfType(type));
@@ -2320,6 +2325,11 @@ function programToJs(db, root, indexer, path) {
   /** @param {Node} node @param {number} depth @param {At} outer */
   const translate = (node, depth, outer) => {
     const at = { ...outer, line: lineOf(node) };
+    // A slow translation names where it is.
+    if (Date.now() - lastBeat > 5000) {
+      lastBeat = Date.now();
+      progress(`still translating ${path}, at ${current.path}:${at.line}`);
+    }
     // What the grammar could not read is not in the tree: translating the rest would drop it without a word.
     // An error in the head of a statement, up to its own ; or THEN, is the whole statement's; one after it
     // is in a statement of the body and gets its own TODO there.
@@ -2584,10 +2594,13 @@ function programToJs(db, root, indexer, path) {
   }
   /** @type {At} */
   const top = { line: 1, scopes: [], loops: [], changed: [], gotos: new Map(), units: false };
+  progress(`read the graph's facts for ${path}, translating its statements`);
+  lastBeat = Date.now();
   for (const node of tree.rootNode.namedChildren) {
     if (!node || node.type === "comment") continue;
     statement(node, 0, top);
   }
+  progress(`translated the statements of ${path}`);
   // The statement handlers read only the parts they know, so a syntax error
   // after an ELSE, in a BEGIN or an ON unit would vanish without this.
   for (const [id, r] of [[file.id, tree.rootNode], ...[...includeTrees].map(([id, i]) => [id, i.tree?.rootNode])]) {
@@ -3401,6 +3414,9 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
   const done = new Set(queue);
   /** @type {{ path: string, member: string, error: string }[]} */
   const failures = [];
+  const readingSince = Date.now();
+  progress("reading the writes and CALL arguments of names the graph found no variable for");
+  progress(`read the writes and CALL arguments of ${unresolvedChanges(db).size} names the graph found no variable for in ${Date.now() - readingSince} ms`);
   while (queue.length) {
     const path = /** @type {string} */ (queue.shift());
     const member = /** @type {{ member: string }} */ (db.prepare(`SELECT member FROM files WHERE path = ?`).get(path)).member;
@@ -3414,7 +3430,7 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     progress(`translating ${path} (${programs.length + failures.length + 1} of ${done.size})`);
     let translated;
     try {
-      translated = programToJs(db, root, indexer, path);
+      translated = programToJs(db, root, indexer, path, progress);
     } catch (error) {
       const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
       failures.push({ path, member, error: text });
