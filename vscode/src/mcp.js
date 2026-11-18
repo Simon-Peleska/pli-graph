@@ -7,10 +7,13 @@
 //
 // Logs go to stderr, which VS Code shows in the server's output.
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createInterface } from "node:readline";
 import { Descriptions, LABELS, subjectKey } from "./descriptions.js";
 import { Graph } from "./graph.js";
+import { GENERATED } from "./source.js";
 
 const [graphFile, root] = process.argv.slice(2);
 const log = (/** @type {string} */ text) => process.stderr.write(`${text}\n`);
@@ -212,6 +215,20 @@ const TOOLS = [
         id: { type: "string", description: "the id of a description to replace" },
       },
       required: ["subject", "text"],
+    },
+  },
+  {
+    name: "todos",
+    description:
+      "What Generate JavaScript could not translate: its TODOs, each with the file and line, why, the programs and jobs it is in (a TODO in an include is in every program including it) and the code. First the counts by reason, then up to 200 TODOs sorted by file and line. Filters combine; none lists all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        program: { type: "string", description: "a program's member name or a job's name: only the TODOs in it" },
+        sub_programs: { type: "boolean", description: "with program: also the TODOs of every program it calls or fetches, directly or not, and for a job of the programs its steps run" },
+        file: { type: "string", description: "a file's path in the workspace, or a folder: only the TODOs in it" },
+        reason: { type: "string", description: "only TODOs whose reason contains this text, without case" },
+      },
     },
   },
   {
@@ -665,6 +682,94 @@ function call(name, args) {
       ? descriptions.update(args.id, { label, text: args.text, author: client })
       : descriptions.add({ subject: subjectKey(open(), args.subject), label, text: args.text, author: client });
     return `Saved as ${written.id} for ${written.subject}.`;
+  }
+  if (name === "todos") {
+    const file = join(root, GENERATED, "JS", "todos.json");
+    if (!existsSync(file)) throw new Error(`[PLG103E] There is no ${file} yet: run PL/I Graph: Generate JavaScript first.`);
+    /** @type {{ path: string, line: number, end: number, why: string, programs: string[], code: string[] }[]} */
+    let todos = JSON.parse(readFileSync(file, "utf-8"));
+    const total = todos.length;
+    const scope = [];
+    if (args.program) {
+      const program = String(args.program).toUpperCase();
+      const known = open().all(`SELECT 1 FROM files WHERE member = ? UNION SELECT 1 FROM symbols WHERE kind = 'job' AND name = ?`, program, program).length;
+      if (!known) return `No program or job ${program} is in the graph.`;
+      const programs = new Set([program]);
+      if (args.sub_programs) {
+        // A job runs its steps' programs (PGM=, the DFSRRC00 PARM, IKJEFT01's RUN PROGRAM, all program refs) and those of the
+        // JCL procedures its steps run. A program's sub programs are the programs it calls or fetches, not includes.
+        const reached = /** @type {{ member: string }[]} */ (
+          open().all(
+            `WITH RECURSIVE jcl(id) AS (
+               SELECT id FROM symbols WHERE kind = 'job' AND name = ?
+               UNION
+               SELECT p.id FROM jcl JOIN steps s ON s.job = jcl.id JOIN symbols p ON p.kind = 'proc' AND p.name = s.procedure),
+             reach(id) AS (
+               SELECT id FROM files WHERE language = 'pli' AND (member = ? OR member IN (SELECT r.name FROM refs r JOIN jcl ON r.caller = jcl.id WHERE r.kind = 'program'))
+               UNION
+               SELECT l.target_file FROM reach JOIN refs r ON r.file = reach.id AND r.kind IN ('call', 'fetch')
+               JOIN links l ON l.ref = r.id JOIN files tf ON tf.id = l.target_file AND tf.language = 'pli'
+               WHERE NOT EXISTS (SELECT 1 FROM links il JOIN refs ir ON ir.id = il.ref AND ir.kind = 'include' WHERE il.target_file = tf.id))
+             SELECT DISTINCT f.member FROM reach JOIN files f ON f.id = reach.id ORDER BY f.member`,
+            program,
+            program,
+          )
+        );
+        for (const r of reached) programs.add(r.member);
+      }
+      const subs = [...programs].filter((p) => p !== program);
+      scope.push(args.sub_programs ? `${program} and its ${subs.length} sub programs${subs.length ? ` ${subs.join(", ")}` : ""}` : program);
+      todos = todos.filter((t) => t.programs.some((p) => programs.has(p)));
+    }
+    if (args.file) {
+      let path = String(args.file).replace(/\\/g, "/");
+      if (path.toUpperCase().startsWith(`${root.replace(/\\/g, "/").toUpperCase()}/`)) path = path.slice(root.length + 1);
+      path = path.replace(/^\.\//, "").replace(/\/$/, "").toUpperCase();
+      scope.push(path);
+      todos = todos.filter((t) => t.path.toUpperCase() === path || t.path.toUpperCase().startsWith(`${path}/`));
+    }
+    if (args.reason) {
+      const reason = String(args.reason).toUpperCase();
+      scope.push(`reasons with "${args.reason}"`);
+      todos = todos.filter((t) => t.why.toUpperCase().includes(reason));
+    }
+    const files = new Set(todos.map((t) => t.path)).size;
+    const head = `${todos.length} of ${total} TODOs in ${files} file${files === 1 ? "" : "s"}${scope.length ? ` for ${scope.join(", ")}` : ""}.`;
+    if (todos.length === 0) return head;
+    // Reasons name the fields, statements, steps and values they are about, as written, and the rest of the text, in lower case,
+    // says what kind of TODO it is: "the INIT of Kunde.Name" is "the … of …", with the names counted under it.
+    /** @type {Map<string, { count: number, names: Map<string, number> }>} */
+    const reasons = new Map();
+    for (const t of todos) {
+      /** @type {string[]} */
+      const names = [];
+      const reason = t.why.replace(/[^\s,:;()'"]+/g, (word) => (/[A-Za-z0-9]/.test(word) && word !== word.toLowerCase() || /^[^a-z]*[0-9]/.test(word) ? (names.push(word), "…") : word));
+      const known = reasons.get(reason) ?? { count: 0, names: new Map() };
+      known.count++;
+      const named = names.join(" ");
+      if (named) known.names.set(named, (known.names.get(named) ?? 0) + 1);
+      reasons.set(reason, known);
+    }
+    const byCount = [...reasons].sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]));
+    /** @param {Map<string, number>} names */
+    const mostNamed = (names) => {
+      const top = [...names].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+      return top.length ? `: ${top.slice(0, 5).map(([n, c]) => `${n} ${c}`).join(", ")}${top.length > 5 ? `, ${top.length - 5} more` : ""}` : "";
+    };
+    const shown = todos.slice(0, 200);
+    return [
+      head,
+      `By reason (${reasons.size}):`,
+      ...byCount.slice(0, 50).map(([reason, { count, names }]) => `  ${String(count).padStart(5)} ${reason}${mostNamed(names)}`),
+      ...(byCount.length > 50 ? [`  ... ${byCount.length - 50} more reasons`] : []),
+      "",
+      ...shown.flatMap((t) => [
+        `${t.path}:${t.line}${t.end > t.line ? `-${t.end}` : ""}: ${t.why} (in ${t.programs.join(", ")})`,
+        ...t.code.slice(0, 3).map((l) => `  > ${l.trim()}`),
+        ...(t.code.length > 3 ? [`  > ... ${t.code.length - 3} more lines`] : []),
+      ]),
+      ...(shown.length < todos.length ? [`Only the first 200 of ${todos.length} TODOs are shown; filter by program, file or reason for the rest.`] : []),
+    ].join("\n");
   }
   if (name === "get_source") {
     const found = defined(args.name);

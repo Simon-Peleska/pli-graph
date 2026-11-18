@@ -3696,7 +3696,7 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
 
   // TODO.md: every TODO once, even when an include puts it in many programs, with the code around it.
   const TODO_CONTEXT = 3;
-  /** @type {Map<string, { path: string, language: string, line: number, end: number, why: string, users: Set<string> }>} */
+  /** @type {Map<string, { path: string, language: string, line: number, end: number, why: string, users: Set<string>, owners: Set<string> }>} */
   const allTodos = new Map();
   const owners = [
     ...programs.map((p) => ({ name: p.member, path: p.path, language: "pli", todos: p.todos })),
@@ -3706,8 +3706,9 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     for (const t of owner.todos) {
       const path = t.path ?? owner.path;
       const key = `${path}:${t.line}:${t.why}`;
-      const known = allTodos.get(key) ?? { path, language: owner.language, line: t.line, end: t.end ?? t.line, why: t.why, users: new Set() };
+      const known = allTodos.get(key) ?? { path, language: owner.language, line: t.line, end: t.end ?? t.line, why: t.why, users: new Set(), owners: new Set() };
       if (path !== owner.path) known.users.add(owner.name);
+      known.owners.add(owner.name);
       allTodos.set(key, known);
     }
   }
@@ -3735,6 +3736,16 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     todoText.push("```", "");
   }
   writeFileSync(join(outDir, "TODO.md"), todoText.join("\n"));
-  progress(`wrote ${sortedTodos.length} TODOs to ${join(outDir, "TODO.md")}`);
+  // The same for the MCP server's todos tool: each with the programs and jobs it is in, and its marked lines.
+  const todoJson = sortedTodos.map((t) => ({
+    path: t.path,
+    line: t.line,
+    end: t.end,
+    why: t.why,
+    programs: [...t.owners].sort(),
+    code: (sourceLines.get(t.path) ?? []).slice(t.line - 1, t.end).map((l) => l.trimEnd()),
+  }));
+  writeFileSync(join(outDir, "todos.json"), JSON.stringify(todoJson));
+  progress(`wrote ${sortedTodos.length} TODOs to ${join(outDir, "TODO.md")} and todos.json`);
   return { programs, transactions: generated.map((t) => t.code), skipped, failures, untranslated, jobs: batch.map((j) => ({ name: j.name, path: j.path, module: `jobs/${j.name}.js`, todos: j.todos })) };
 }

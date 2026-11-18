@@ -326,7 +326,8 @@ extension keeps of each workspace folder:
   `TODO.md` lists every TODO once, sorted by file and line, even when an
   include puts it into many programs (it names them): the code the
   generator could not translate, marked with `>`, and 3 lines around it.
-  **PL/I Graph: Show TODOs**, also in the status bar menu, opens it. With
+  **PL/I Graph: Show TODOs**, also in the status bar menu, opens it.
+  `todos.json` holds the same for the MCP server's `todos` tool. With
   `SQLITE=<file>` (`SQLITE=data.db node server.js`, or before a job) the
   SQL runs on that SQLite file instead, no `ibm_db` needed: on first use it
   creates the tables from `sqlite.sql` (every Db2 table of the graph, with
@@ -461,7 +462,10 @@ extension keeps of each workspace folder:
   field is set, passed to a CALL or compared, under which IF, WHEN, DO and
   ON conditions), `lineage` (where a variable's value comes from and goes
   to: assignments, and arguments bound to parameters), `text` (comments
-  and string literals containing a word or message code), `get_source` and
+  and string literals containing a word or message code), `todos` (what
+  Generate JavaScript could not translate, counted by reason, of a program
+  alone or with every program it calls, of a file or folder, or with a
+  reason), `get_source` and
   `query_graph`, a read-only SQL query over the
   tables below. Copilot lists them under the tools button in agent mode,
   and **MCP: List Servers** starts, stops and shows the server's log. It
@@ -927,6 +931,8 @@ so on them only the silent gaps apply.
 - `PLG102W` Generate JavaScript: a main or message program gets no
   transaction, because its code, its name or the name with the learned
   type letter, already runs another program. It is still translated.
+- `PLG103E` MCP `todos`: there is no `generated/JS/todos.json` yet; run
+  **PL/I Graph: Generate JavaScript** first.
 
 The graph page's own codes: `VIZ-101` the id in the URL is not in the graph,
 `VIZ-102` a view could not be drawn, `VIZ-103` the details, `VIZ-104` the

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { openGraph, sync } from "../src/indexer.js";
+import { GENERATED } from "../src/source.js";
+import { generateJs } from "../src/tojs.js";
 import { indexer } from "./indexed.js";
 
 const fixture = join(import.meta.dirname, "fixture");
@@ -17,9 +19,8 @@ for (const root of [fixture, facts]) {
 }
 
 /** Runs the server over stdio with these requests and gives back its replies by id. @param {object[]} requests */
-function serve(requests, root = fixture) {
+function serve(requests, root = fixture, graphFile = join(graphs, `${basename(root)}.sqlite`)) {
   const input = requests.map((request, i) => JSON.stringify({ jsonrpc: "2.0", id: i + 1, ...request })).join("\n");
-  const graphFile = join(graphs, `${basename(root)}.sqlite`);
   const output = execFileSync(process.execPath, [join(import.meta.dirname, "../src/mcp.js"), graphFile, root], { input, stdio: ["pipe", "pipe", "ignore"] });
   return output.toString().trim().split("\n").map((line) => JSON.parse(line));
 }
@@ -33,7 +34,7 @@ test("the server introduces itself and lists its tools", () => {
   assert.equal(hello.result.serverInfo.name, "pli-graph");
   assert.deepEqual(
     list.result.tools.map((/** @type {any} */ t) => t.name),
-    ["find_definition", "find_references", "dependencies", "dependents", "dataset", "batch_chain", "hotspots", "data_owners", "program_files", "table_columns", "psb", "screen", "screen_input", "column_path", "dli", "transaction", "data_use", "dead_code", "messages", "decision_table", "field", "lineage", "text", "subjects", "descriptions", "describe", "get_source", "query_graph"],
+    ["find_definition", "find_references", "dependencies", "dependents", "dataset", "batch_chain", "hotspots", "data_owners", "program_files", "table_columns", "psb", "screen", "screen_input", "column_path", "dli", "transaction", "data_use", "dead_code", "messages", "decision_table", "field", "lineage", "text", "subjects", "descriptions", "describe", "todos", "get_source", "query_graph"],
   );
 });
 
@@ -53,6 +54,67 @@ test("the tools answer from the graph", () => {
   assert.match(dependents, /shop\/main\.pli/);
   assert.match(source, /^procedure INNER, shop\/helper\.pli:\n\s+2    inner: proc;/);
   assert.deepEqual(JSON.parse(query), [{ n: 1 }]);
+});
+
+test("todos lists what Generate JavaScript could not translate, for a program with all its sub programs too", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-todos-"));
+  const write = (/** @type {string} */ path, /** @type {string[]} */ lines) => {
+    mkdirSync(join(root, dirname(path)), { recursive: true });
+    writeFileSync(join(root, path), `${lines.join("\n")}\n`);
+  };
+  write("SRC/ZZP00001", [" ZZP00001: PROC OPTIONS(MAIN);", "   CALL ZZP00002;", " END ZZP00001;"]);
+  write("SRC/ZZP00002", [" ZZP00002: PROC;", "   %INCLUDE ZZC00001;", "   CALL ZZP00003;", " END ZZP00002;"]);
+  write("INCLUDE/ZZC00001", ["   FLUSH FILE(*);"]);
+  write("SRC/ZZP00003", [" ZZP00003: PROC;", "   DELAY (100);", " END ZZP00003;"]);
+  write("SRC/ZZP00009", [" ZZP00009: PROC OPTIONS(MAIN);", "   DELAY (5);", " END ZZP00009;"]);
+  write("JCL/ZZJOB01", ["//ZZJOB01  JOB (ACCT),'TODOS',CLASS=A", "//EINS     EXEC PGM=IKJEFT01", "//SYSTSIN  DD *", "  RUN PROGRAM(ZZP00003)", "/*", "//ZWEI     EXEC ZZJPRC1"]);
+  write("JCL/ZZJPRC1", ["//ZZJPRC1  PROC", "//LAUF     EXEC PGM=ZZP00009"]);
+  const graphFile = join(graphs, "todos.sqlite");
+  const db = openGraph(graphFile);
+  await sync(db, root, indexer);
+  const [missing] = serve([tool("todos", {})], root, graphFile);
+  assert.equal(missing.result.isError, true);
+  assert.match(missing.result.content[0].text, /\[PLG103E\] There is no .*todos\.json yet: run PL\/I Graph: Generate JavaScript first\./);
+
+  const templates = join(import.meta.dirname, "../src/jsruntime");
+  generateJs(db, root, indexer, join(root, GENERATED, "JS"), { templates, tn3270: join(import.meta.dirname, "../screen/vendor/tn3270") });
+  db.close();
+  const texts = serve(
+    [
+      tool("todos", {}),
+      tool("todos", { program: "zzp00001" }),
+      tool("todos", { program: "ZZP00001", sub_programs: true }),
+      tool("todos", { program: "ZZP00002" }),
+      tool("todos", { file: "INCLUDE/" }),
+      tool("todos", { reason: "delay" }),
+      tool("todos", { program: "ZZJOB01", sub_programs: true }),
+      tool("todos", { program: "NIX" }),
+      tool("todos", { file: `${root}/src/zzp00003` }),
+    ],
+    root,
+    graphFile,
+  ).map((r) => r.result.content[0].text);
+  assert.deepEqual(texts[0].split("\n"), [
+    "3 of 3 TODOs in 3 files.",
+    "By reason (1):",
+    "      3 the … statement: DELAY 2, FLUSH 1",
+    "",
+    "INCLUDE/ZZC00001:1: the FLUSH statement (in ZZP00002)",
+    "  > FLUSH FILE(*);",
+    "SRC/ZZP00003:2: the DELAY statement (in ZZP00003)",
+    "  > DELAY (100);",
+    "SRC/ZZP00009:2: the DELAY statement (in ZZP00009)",
+    "  > DELAY (5);",
+  ]);
+  assert.equal(texts[1], "0 of 3 TODOs in 0 files for ZZP00001.");
+  assert.match(texts[2], /^2 of 3 TODOs in 2 files for ZZP00001 and its 2 sub programs ZZP00002, ZZP00003\.\n/);
+  assert.doesNotMatch(texts[2], /ZZP00009/);
+  assert.match(texts[3], /^1 of 3 TODOs in 1 file for ZZP00002\.\n[^]*INCLUDE\/ZZC00001:1/);
+  assert.match(texts[4], /^1 of 3 TODOs in 1 file for INCLUDE\.\n/);
+  assert.match(texts[5], /^2 of 3 TODOs in 2 files for reasons with "delay"\.\n/);
+  assert.match(texts[6], /^2 of 3 TODOs in 2 files for ZZJOB01 and its 2 sub programs ZZP00003, ZZP00009\.\n/);
+  assert.equal(texts[7], "No program or job NIX is in the graph.");
+  assert.match(texts[8], /^1 of 3 TODOs in 1 file for SRC\/ZZP00003\.\n/);
 });
 
 test("dataset tells who writes and who reads a dataset", () => {
