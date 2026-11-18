@@ -801,13 +801,15 @@ ZZF004O  MSG   TYPE=OUTPUT,SOR=(ZZF004,IGNORE)
   /** @type {string[]} */
   const said = [];
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, progress: (/** @type {string} */ text) => said.push(text) });
-  assert.deepEqual(summary.transactions, ["ZZK00400"]);
+  // ZZS00999, a main program no job runs, is a transaction too, with the learned type letter.
+  assert.deepEqual(summary.transactions, ["ZZK00400", "ZZK00999"]);
   assert.deepEqual(summary.skipped.map((s) => s.code), ["ZZK00500"]);
-  assert.ok(said.some((s) => s.startsWith("[PLG088W] the input screen mfs/ZZF005 ZZF005I sends ZZK00500")), said.join("\n"));
+  assert.ok(said.some((s) => s.startsWith("[PLG088W] no transaction uses the input screen mfs/ZZF005 ZZF005I: no PL/I program is named like the code ZZK00500")), said.join("\n"));
+  assert.ok(existsSync(join(out, "screens/ZZF005.js")));
   assert.match(readFileSync(join(out, "transactions.js"), "utf-8"), /ZZK00400: \{ program: \(\) => import\("\.\/programs\/ZZS00400\.js"\), entry: "ZZS00400", screens: ZZF004, input: "ZZF004I" \}/);
 });
 
-test("a message program no screen reaches is an IMS Connect service taking the raw message, and the untranslated PL/I files are listed", async () => {
+test("a message program no screen reaches is an IMS Connect service taking the raw message, and the PL/I files left untranslated are listed", async () => {
   const root = mkdtempSync(join(tmpdir(), "pli-src-"));
   mkdirSync(join(root, "pli"));
   writeFileSync(
@@ -825,6 +827,7 @@ test("a message program no screen reaches is an IMS Connect service taking the r
 `,
   );
   writeFileSync(join(root, "pli/ZZS00701"), ` ZZS00701: PROC OPTIONS(MAIN);\n END ZZS00701;\n`);
+  writeFileSync(join(root, "pli/ZZC00701"), `   DCL ZZ_UNBENUTZT CHAR(1);\n`);
   // A screen transaction teaches the code's type letter: ZZK00400 runs ZZS00400, so the service ZZS00700 is ZZK00700.
   writeFileSync(join(root, "pli/ZZS00400"), ` ZZS00400: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n END ZZS00400;\n`);
   mkdirSync(join(root, "mfs"));
@@ -833,15 +836,87 @@ test("a message program no screen reaches is an IMS Connect service taking the r
   /** @type {string[]} */
   const said = [];
   const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, progress: (/** @type {string} */ text) => said.push(text) });
-  assert.deepEqual(summary.transactions, ["ZZK00400", "ZZK00700"]);
-  assert.deepEqual(summary.untranslated, [{ path: "pli/ZZS00701", why: "no transaction, job or translated program reaches it" }]);
-  assert.ok(said.some((s) => s.includes("pli/ZZS00701")), said.join("\n"));
+  assert.deepEqual(summary.transactions, ["ZZK00400", "ZZK00700", "ZZK00701"]);
+  assert.ok(summary.programs.some((p) => p.member === "ZZS00701"));
+  assert.deepEqual(summary.untranslated, [{ path: "pli/ZZC00701", why: "no procedure, and no program includes it" }]);
+  assert.ok(said.some((s) => s.includes("pli/ZZC00701")), said.join("\n"));
   const { handle } = await import(pathToFileURL(join(out, "server.js")).href);
   const { status, body } = await handle("POST", "/ZZK00700", { message: "ABCDE" });
   assert.equal(status, 200, body);
   assert.deepEqual(JSON.parse(body).reply, ["HALLO"]);
   const both = await Promise.all([handle("POST", "/ZZK00700", { message: "ABCDE" }), handle("POST", "/ZZK00700", { message: "FGHIJ" })]);
   assert.deepEqual(both.map((r) => r.status), [200, 200], both.map((r) => r.body).join("\n"));
+});
+
+test("every program is translated, and a main program shows the screen named like it: ABS00100 shows ABF001", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "pli"));
+  mkdirSync(join(root, "mfs"));
+  writeFileSync(join(root, "pli/ZZS00100"), ` ZZS00100: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n   CALL ZZU00300;\n END ZZS00100;\n`);
+  // A copy of the callee in a folder sorting first: the call still runs the one beside the caller, which the graph links.
+  writeFileSync(join(root, "pli/ZZU00300"), ` ZZU00300: PROC;\n END ZZU00300;\n`);
+  mkdirSync(join(root, "0"));
+  writeFileSync(join(root, "0/ZZU00300"), ` ZZU00300: PROC;\n END ZZU00300;\n`);
+  // A caller no transaction reaches, in a folder sorting after its callee's other copy.
+  writeFileSync(join(root, "pli/ZZU00400"), ` ZZU00400: PROC;\n   CALL ZZU00500;\n END ZZU00400;\n`);
+  writeFileSync(join(root, "pli/ZZU00500"), ` ZZU00500: PROC;\n END ZZU00500;\n`);
+  writeFileSync(join(root, "0/ZZU00500"), ` ZZU00500: PROC;\n END ZZU00500;\n`);
+  // A transaction of the system definition whose screen sends no code: it is the one named like its program.
+  mkdirSync(join(root, "sysdef"));
+  writeFileSync(join(root, "sysdef/ZZSYSDEF"), "* IMS STAGE 1\n         APPLCTN PSB=ZZS00600,PGMTYPE=TP\n         TRANSACT CODE=ZZ06\n");
+  writeFileSync(join(root, "pli/ZZS00600"), ` ZZS00600: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n END ZZS00600;\n`);
+  writeFileSync(
+    join(root, "mfs/ZZF00600"),
+    `ZZF006   FMT\nKDNR     DFLD  POS=(3,20),LTH=8\n         FMTEND\nZZF006I  MSG   TYPE=INPUT,SOR=(ZZF006,IGNORE)\n         SEG\n         MFLD  KDNR,LTH=8\n         MSGEND\n         END\n`,
+  );
+  // A batch program named like the screen too: a job runs it, so it is no dialog program.
+  writeFileSync(join(root, "pli/ZZB00100"), ` ZZB00100: PROC OPTIONS(MAIN);\n END ZZB00100;\n`);
+  mkdirSync(join(root, "jcl"));
+  writeFileSync(join(root, "jcl/ZZJ00100"), `//ZZJ00100 JOB (ACCT),'BATCH',CLASS=A\n//EINS     EXEC PGM=ZZB00100\n//OUT      DD SYSOUT=*\n`);
+  // Reached by no transaction, job or call, yet translated.
+  writeFileSync(join(root, "pli/ZZU00200"), ` ZZU00200: PROC(X);\n   DCL X FIXED BIN(31);\n   X = 1;\n END ZZU00200;\n`);
+  // The MFS member ZZF00100 holds the screen ZZF001; its input message sends no code, its first field is a DFLD's.
+  writeFileSync(
+    join(root, "mfs/ZZF00100"),
+    `ZZF001   FMT\nKDNR     DFLD  POS=(3,20),LTH=8\n         FMTEND\nZZF001I  MSG   TYPE=INPUT,SOR=(ZZF001,IGNORE)\n         SEG\n         MFLD  KDNR,LTH=8\n         MSGEND\n         END\n`,
+  );
+  writeFileSync(
+    join(root, "mfs/ZZF00900"),
+    `ZZF009   FMT\nKDNR     DFLD  POS=(3,20),LTH=8\n         FMTEND\nZZF009I  MSG   TYPE=INPUT,SOR=(ZZF009,IGNORE)\n         SEG\n         MFLD  KDNR,LTH=8\n         MSGEND\n         END\n`,
+  );
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  /** @type {string[]} */
+  const said = [];
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES, progress: (/** @type {string} */ text) => said.push(text) });
+  assert.deepEqual(summary.transactions, ["ZZ06", "ZZS00100"]);
+  assert.deepEqual(summary.programs.map((p) => p.member).sort(), ["ZZB00100", "ZZS00100", "ZZS00600", "ZZU00200", "ZZU00300", "ZZU00400", "ZZU00500"]);
+  assert.equal(summary.programs.find((p) => p.member === "ZZU00300")?.path, "pli/ZZU00300");
+  assert.equal(summary.programs.find((p) => p.member === "ZZU00500")?.path, "pli/ZZU00500");
+  assert.deepEqual(summary.untranslated, [
+    { path: "0/ZZU00300", why: "a copy of ZZU00300, translated from pli/ZZU00300" },
+    { path: "0/ZZU00500", why: "a copy of ZZU00500, translated from pli/ZZU00500" },
+  ]);
+  assert.match(readFileSync(join(out, "transactions.js"), "utf-8"), /ZZ06: \{ program: \(\) => import\("\.\/programs\/ZZS00600\.js"\), entry: "ZZS00600", screens: ZZF00600, input: "ZZF006I" \}/);
+  assert.match(readFileSync(join(out, "transactions.js"), "utf-8"), /ZZS00100: \{ program: \(\) => import\("\.\/programs\/ZZS00100\.js"\), entry: "ZZS00100", screens: ZZF00100, input: "ZZF001I" \}/);
+  assert.ok(existsSync(join(out, "screens/ZZF00900.js")));
+  assert.ok(said.some((s) => s.startsWith("[PLG088W] no transaction uses the input screen mfs/ZZF00900 ZZF009I: no main program")), said.join("\n"));
+});
+
+test("a main program keeps its own name as code when another's swapped type letter would take it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pli-src-"));
+  mkdirSync(join(root, "pli"));
+  mkdirSync(join(root, "mfs"));
+  // ZZK00400 runs ZZS00400 teaches the type letter K, so ZZA00700 would be ZZK00700, the name of another main program.
+  writeFileSync(join(root, "pli/ZZS00400"), ` ZZS00400: PROC(IOPCB) OPTIONS(MAIN);\n   DCL IOPCB PTR;\n END ZZS00400;\n`);
+  writeFileSync(join(root, "mfs/ZZF004"), `ZZF004   FMT\nKDNR     DFLD  POS=(3,20),LTH=8\n         FMTEND\nZZF004I  MSG   TYPE=INPUT,SOR=(ZZF004,IGNORE)\n         SEG\n         MFLD  'ZZK00400',LTH=8\n         MSGEND\n         END\n`);
+  writeFileSync(join(root, "pli/ZZA00700"), ` ZZA00700: PROC OPTIONS(MAIN);\n END ZZA00700;\n`);
+  writeFileSync(join(root, "pli/ZZK00700"), ` ZZK00700: PROC OPTIONS(MAIN);\n END ZZK00700;\n`);
+  const out = mkdtempSync(join(tmpdir(), "pli-js-"));
+  const summary = generateJs(await indexed(root), root, indexer, out, { ...TEMPLATES });
+  assert.deepEqual(summary.transactions, ["ZZA00700", "ZZK00400", "ZZK00700"]);
+  const transactions = readFileSync(join(out, "transactions.js"), "utf-8");
+  assert.match(transactions, /ZZK00700: \{ program: \(\) => import\("\.\/programs\/ZZK00700\.js"\)/);
+  assert.match(transactions, /ZZA00700: \{ program: \(\) => import\("\.\/programs\/ZZA00700\.js"\)/);
 });
 
 test("TODO.md lists every TODO once with its code marked and the lines around it", async () => {

@@ -299,9 +299,9 @@ extension keeps of each workspace folder:
   seconds for 6 million lines, in a worker thread.
 - **PL/I Graph: Generate JavaScript** writes into `generated/JS` in the
   workspace folder (which the graph leaves out, like hidden folders) a
-  JavaScript translation of the program of every IMS transaction and of the
-  programs they call: `programs/<MEMBER>.js`, the MFS formats and messages
-  in `screens/`, `runtime.js` (PL/I types and built-ins, IMS message calls,
+  JavaScript translation of every PL/I program, every file with a procedure
+  that no other file includes: `programs/<MEMBER>.js`, the formats and
+  messages of every MFS screen with an input message in `screens/`, `runtime.js` (PL/I types and built-ins, IMS message calls,
   Db2 through `ibm_db` and `DB2_CONNECTION`) and `server.js`, which shows
   each transaction's input screen on tn3270's terminal (`terminal.js` and
   `tn3270/`, the same one *Show 3270 Screen* draws) at
@@ -309,9 +309,14 @@ extension keeps of each workspace folder:
   message, runs the program and shows the screen of its reply; Clear blanks
   the screen (`npm install && node server.js`, `PORT` defaults to 8080).
   Without a system definition, a transaction is the code an MFS input
-  message starts with (see `PLG087W`). A message program, one reading its
-  input with `GU` on the I/O PCB, that no transaction runs is called through
-  IMS Connect. Its code is the program's name with the third character
+  message starts with (see `PLG087W`). A transaction's screen is the one
+  sending its code, else the one named like the code or its program: the
+  first two characters, `F` and the first three digits, so `ABS00100` shows
+  `ABF001` (input message `ABF001I`). A message program, one reading its
+  input with `GU` on the I/O PCB, or a main program no job runs, that no
+  transaction runs is a transaction too, as real repos keep no system
+  definition; without a screen it is
+  called through IMS Connect. Its code is the program's name with the third character
   the screen transactions' codes mostly have where their program differs
   (`AEK00700` for `AES00700`, learned from `AEK00400` running `AES00400`),
   else the program's name; `POST /<CODE>` with `{"message": "..."}` runs it
@@ -884,17 +889,18 @@ so on them only the silent gaps apply.
 - `PLG086E` Generate JavaScript: translating one program failed; it is left
   out, the others are generated, and the summary has the stack trace.
 - `PLG087W` Generate JavaScript found no IMS transaction: the repo has no
-  `TRANSACT` of a system definition, and no MFS input message names a PL/I
-  program. The warning lists the codes the input messages do start with.
+  `TRANSACT` of a system definition, no MFS input message names a PL/I
+  program, and no program reads messages or is a main program no job runs. The warning lists the codes the input messages do start with.
   Without a system definition, a screen whose input message's first `MFLD`
   is `'AEK00400'` makes `AEK00400` a transaction, run by the PL/I program
   `AEK00400`, or else by the one program that differs from it only in the
   third character, the member type, such as `AES00400`. Of several such
   members, subprograms like `AEU00400` drop out: those without
   `OPTIONS(MAIN)`, then those other programs call.
-- `PLG088W` Generate JavaScript: an MFS input message sends a transaction
-  code, but no PL/I program is named like it or differs from it only in the
-  third character; the transaction is left out.
+- `PLG088W` Generate JavaScript: no transaction uses an MFS input message.
+  No PL/I program is named like the code it sends or differs from it only
+  in the third character, and no main program is named like the screen
+  (`ABS00100` for `ABF001`). The screen is still generated.
 - `PLG089E` Show TODOs: there is no `generated/JS/TODO.md` yet; run
   Generate JavaScript first.
 - `PLG090W` Descriptions: a line of `pli-graph.descriptions.jsonl` is no
@@ -918,6 +924,9 @@ so on them only the silent gaps apply.
 - `PLG101I` A sync read COBOL members (DCLGEN output, copybooks) among the
   PL/I ones; they are in the `files` table with language `cobol` and no
   facts, and their syntax is not counted as errors.
+- `PLG102W` Generate JavaScript: a main or message program gets no
+  transaction, because its code, its name or the name with the learned
+  type letter, already runs another program. It is still translated.
 
 The graph page's own codes: `VIZ-101` the id in the URL is not in the graph,
 `VIZ-102` a view could not be drawn, `VIZ-103` the details, `VIZ-104` the

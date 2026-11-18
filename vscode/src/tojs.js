@@ -3289,16 +3289,52 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
       .prepare(`SELECT t.name AS code, r.name AS program FROM symbols t JOIN refs r ON r.caller = t.id AND r.kind = 'program' WHERE t.kind = 'transaction' ORDER BY t.name`)
       .all()
   );
-  // The input message of a transaction starts with its code, an MFLD literal.
-  const inputs = /** @type {{ message: string, path: string, literal: string }[]} */ (
+  // The input messages of the screens. One whose first MFLD is a literal sends that as the transaction code.
+  const inputs = /** @type {{ message: string, path: string, literal: string | null }[]} */ (
     db
       .prepare(
-        `SELECT m.name AS message, f.path, d.literal FROM mfs_fields d JOIN symbols m ON m.id = d.screen JOIN files f ON f.id = m.file
-         WHERE d.kind = 'MFLD' AND d.literal IS NOT NULL AND m.kind = 'message' AND m.detail = 'INPUT' AND d.id = (SELECT min(id) FROM mfs_fields WHERE screen = m.id)
-         ORDER BY f.path, m.line`,
+        `SELECT m.name AS message, f.path, (SELECT CASE WHEN d.kind = 'MFLD' THEN d.literal END FROM mfs_fields d WHERE d.screen = m.id ORDER BY d.id LIMIT 1) AS literal
+         FROM symbols m JOIN files f ON f.id = m.file WHERE m.kind = 'message' AND m.detail = 'INPUT' ORDER BY f.path, m.line`,
       )
       .all()
-  ).map((i) => ({ ...i, code: i.literal.trim().split(/\s+/)[0].toUpperCase() }));
+  ).map((i) => ({ ...i, code: /^[A-Z0-9@#$]{1,8}$/i.exec(i.literal?.trim().split(/\s+/)[0] ?? "")?.[0].toUpperCase() }));
+  /** The screen a member shows, by the naming rule: ABS00100 shows ABF001, the type letter F and its first three digits. @param {string} name */
+  const screenOf = (name) => (name.length >= 6 ? `${name.slice(0, 2)}F${name.slice(3, 6)}` : undefined);
+  const jobIds = /** @type {{ id: number }[]} */ (
+    jobs
+      ? db.prepare(`SELECT s.id FROM symbols s JOIN files f ON f.id = s.file WHERE s.kind = 'job' AND f.path IN (SELECT value FROM json_each(?)) ORDER BY s.name`).all(JSON.stringify(jobs))
+      : paths
+        ? []
+        : db.prepare(`SELECT id FROM symbols WHERE kind = 'job' ORDER BY name`).all()
+  ).map((j) => jobToJs(db, root, j.id, pathOfMember));
+  const batch = jobs ? jobIds : jobIds.filter((j) => j.programs.length);
+  /** @type {Map<string, typeof inputs>} the input messages of each screen name, ABF001 for ABF001I */
+  const inputsOfScreen = new Map();
+  /** @type {Map<string, typeof inputs>} the input messages sending each code */
+  const inputsOfCode = new Map();
+  for (const i of inputs) {
+    inputsOfScreen.set(i.message.slice(0, 6), [...(inputsOfScreen.get(i.message.slice(0, 6)) ?? []), i]);
+    if (i.code) inputsOfCode.set(i.code, [...(inputsOfCode.get(i.code) ?? []), i]);
+  }
+  const memberOf = db.prepare(`SELECT member FROM files WHERE path = ?`);
+  const batchMembers = new Set(batch.flatMap((j) => j.programs).map((path) => /** @type {{ member: string }} */ (memberOf.get(path)).member));
+  // The main programs no other calls and no job runs, by the screen they are named like: the dialog programs. The type letter is
+  // not in the screen's name, so without leaving out the batch programs ABB00100 would show ABF001 too.
+  /** @type {Map<string, string[]>} */
+  const mainsOfScreen = new Map();
+  const mains = /** @type {{ member: string }[]} */ (
+    db
+      .prepare(
+        `SELECT DISTINCT f.member FROM files f JOIN symbols s ON s.file = f.id
+         WHERE f.language = 'pli' AND s.kind = 'procedure' AND s.parent IS NULL AND s.detail LIKE '%OPTIONS%MAIN%'
+           AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.name = f.member AND r.kind IN ('call', 'fetch')) ORDER BY f.member`,
+      )
+      .all()
+  ).map((m) => m.member);
+  for (const m of mains) {
+    const screen = screenOf(m);
+    if (screen && inputsOfScreen.has(screen) && !batchMembers.has(m)) mainsOfScreen.set(screen, [...(mainsOfScreen.get(screen) ?? []), m]);
+  }
   /**
    * The program of a transaction an input screen sends: the member named like
    * its code, else the one only its third character, the type letter of
@@ -3332,62 +3368,66 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     }
     return candidates.length === 1 ? candidates[0].member : undefined;
   };
-  // Without a system definition in the repo, the code an input screen sends is the transaction.
-  const codesOnScreens = [...new Set(inputs.map((i) => i.code))];
+  // Without a system definition in the repo, the code an input screen sends is the transaction. It runs the program named like the
+  // code, else the one main program named like the screen.
+  const codesOnScreens = [...new Set(inputs.flatMap((i) => (i.code ? [i.code] : [])))];
   const known = new Set(fromSysdef.map((t) => t.code));
   /** @type {string[]} */
   const unmatched = [];
   const fromScreens = codesOnScreens.flatMap((code) => {
     if (known.has(code)) return [];
-    const program = programOf(code);
+    const screens = new Set((inputsOfCode.get(code) ?? []).map((i) => i.message.slice(0, 6)));
+    const namedLikeScreen = [...screens].flatMap((screen) => mainsOfScreen.get(screen) ?? []);
+    const program = programOf(code) ?? (namedLikeScreen.length === 1 ? namedLikeScreen[0] : undefined);
     if (!program) unmatched.push(code);
     return program ? [{ code, program }] : [];
   });
   const transactions = [...fromSysdef, ...fromScreens].sort((a, b) => a.code.localeCompare(b.code));
-  const jobIds = /** @type {{ id: number }[]} */ (
-    jobs
-      ? db.prepare(`SELECT s.id FROM symbols s JOIN files f ON f.id = s.file WHERE s.kind = 'job' AND f.path IN (SELECT value FROM json_each(?)) ORDER BY s.name`).all(JSON.stringify(jobs))
-      : paths
-        ? []
-        : db.prepare(`SELECT id FROM symbols WHERE kind = 'job' ORDER BY name`).all()
-  ).map((j) => jobToJs(db, root, j.id, pathOfMember));
-  const batch = jobs ? jobIds : jobIds.filter((j) => j.programs.length);
   progress(
     `${fromSysdef.length} transactions from the IMS system definition, ${fromScreens.length} more named by the ${inputs.length} MFS input messages, and ${batch.length} batch jobs with PL/I programs in the graph`,
   );
-  for (const code of jobs || paths || !transactions.length ? [] : unmatched) {
-    const screens = [...new Set(inputs.filter((i) => i.code === code).map((i) => `${i.path} ${i.message}`))];
-    progress(`[PLG088W] the input screen ${screens.join(", ")} sends ${code}, but no PL/I program is named like it or differs from it only in the third character; it is left out`);
-  }
-  if (!transactions.length && !jobs && !paths) {
-    const named = codesOnScreens.length ? `, they name ${codesOnScreens.slice(0, 20).join(", ")}${codesOnScreens.length > 20 ? ", ..." : ""}` : "";
-    progress(
-      `[PLG087W] no IMS transactions: no TRANSACT in a system definition, and no MFS input message starts with a literal naming a PL/I program, or one differing from it only in the third character${named}`,
-    );
-  }
-  // A message program, reading its input with GU on the I/O PCB, that no transaction runs is called through IMS Connect, without a
-  // screen. Its code is not in the repo: it is the program's name with the third character the screen transactions' codes mostly
-  // have where their program's differs (AEK00700 for AES00700), else the program's name.
+  // Real repos keep no system definition, so every program reading messages with GU on the I/O PCB and every main program no job
+  // runs is a transaction: one called through IMS Connect, without a screen, or one whose screen sends no code. Its code is not in
+  // the repo: it is the program's name with the third character the screen transactions' codes mostly have where their program's
+  // differs (AEK00700 for AES00700), else the program's name.
   const running = new Set(transactions.map((t) => t.program));
-  const services = /** @type {{ member: string }[]} */ (
+  const messagePrograms = /** @type {{ member: string }[]} */ (
     jobs || paths
       ? []
       : db.prepare(`SELECT DISTINCT f.member FROM dli_calls d JOIN files f ON f.id = d.file WHERE d.function = 'GU' AND d.pcb_parameter = 1 AND f.language = 'pli' ORDER BY f.member`).all()
-  ).filter((s) => !running.has(s.member));
+  ).map((s) => s.member);
+  const reading = new Set(messagePrograms);
+  const onlineMains = jobs || paths ? [] : mains.filter((m) => !batchMembers.has(m));
+  const services = [...new Set([...messagePrograms, ...onlineMains])].filter((member) => !running.has(member)).sort();
   /** @type {Map<string, number>} */
   const letters = new Map();
   for (const t of fromScreens) if (t.code !== t.program) letters.set(t.code[2], (letters.get(t.code[2]) ?? 0) + 1);
   const letter = [...letters].sort((a, b) => b[1] - a[1])[0]?.[0];
   const codes = new Set(transactions.map((t) => t.code));
-  for (const s of services) {
-    const named = letter && s.member.length > 3 ? `${s.member.slice(0, 2)}${letter}${s.member.slice(3)}` : s.member;
-    const code = codes.has(named) ? s.member : named;
-    if (codes.has(code)) continue;
+  // The swapped name may be another service's own name, ZZA00700 becoming ZZK00700: that one keeps it.
+  const members = new Set(services);
+  for (const member of services) {
+    const named = letter && member.length > 3 ? `${member.slice(0, 2)}${letter}${member.slice(3)}` : member;
+    const code = codes.has(named) || (named !== member && members.has(named)) ? member : named;
+    if (codes.has(code)) {
+      progress(`[PLG102W] ${member} is no transaction: its code ${code} already runs ${transactions.find((t) => t.code === code)?.program}`);
+      continue;
+    }
     codes.add(code);
-    transactions.push({ code, program: s.member });
-    progress(`${s.member} reads messages but no screen reaches it: generated as the IMS Connect service ${code}`);
+    transactions.push({ code, program: member });
+    progress(
+      `${member} ${reading.has(member) ? "reads messages" : "is a main program no job runs"} and no screen's code reaches: generated as the transaction ${code}${
+        inputsOfScreen.has(screenOf(member) ?? "") ? ` with the screen ${screenOf(member)}` : ", an IMS Connect service"
+      }`,
+    );
   }
   transactions.sort((a, b) => a.code.localeCompare(b.code));
+  if (!transactions.length && !jobs && !paths) {
+    const named = codesOnScreens.length ? `, they name ${codesOnScreens.slice(0, 20).join(", ")}${codesOnScreens.length > 20 ? ", ..." : ""}` : "";
+    progress(
+      `[PLG087W] no IMS transactions: no TRANSACT in a system definition, and no MFS input message starts with a literal naming a PL/I program, or one differing from it only in the third character, and no PL/I program reads messages or is a main program no job runs${named}`,
+    );
+  }
   /** @type {{ code: string, program: string, why: string }[]} */
   const skipped = [];
   /** @type {string[]} */
@@ -3399,7 +3439,21 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
     else skipped.push({ code: t.code, program: t.program, why: `no PL/I member ${t.program}` });
   }
   for (const s of skipped) progress(`[PLG085W] transaction ${s.code} is skipped: ${s.why}`);
-  for (const code of jobs || paths ? [] : unmatched) skipped.push({ code, program: "?", why: "no PL/I program named like it or differing from it only in the third character" });
+  for (const code of jobs || paths ? [] : unmatched.filter((c) => !codes.has(c))) skipped.push({ code, program: "?", why: "no PL/I program named like it, differing from it only in the third character, or named like its screen" });
+  // Also the programs no transaction or job reaches: services whose code is nowhere in the repo, and anything else IMS Connect calls.
+  // The members nothing calls come first, so their callees are translated from the copy the graph linked, not the first by path.
+  const allPrograms = /** @type {{ path: string }[]} */ (
+    jobs || paths
+      ? []
+      : db
+          .prepare(
+            `SELECT f.path FROM files f WHERE f.language = 'pli'
+               AND EXISTS (SELECT 1 FROM symbols s WHERE s.file = f.id AND s.kind = 'procedure' AND s.parent IS NULL)
+               AND NOT EXISTS (SELECT 1 FROM links l JOIN refs r ON r.id = l.ref AND r.kind = 'include' WHERE l.target_file = f.id)
+             ORDER BY EXISTS (SELECT 1 FROM refs r WHERE r.name = f.member AND r.kind IN ('call', 'fetch')), f.path`,
+          )
+          .all()
+  ).map((p) => p.path);
   const programPaths = [...new Set([...(paths ?? transactionPaths), ...batch.flatMap((j) => j.programs)])];
 
   mkdirSync(join(outDir, "programs"), { recursive: true });
@@ -3414,20 +3468,33 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
   const done = new Set(queue);
   /** @type {{ path: string, member: string, error: string }[]} */
   const failures = [];
+  /** @type {Map<string, string>} the path each member is translated from, or failed */
+  const pathOfTranslated = new Map();
   const readingSince = Date.now();
   progress("reading the writes and CALL arguments of names the graph found no variable for");
   progress(`read the writes and CALL arguments of ${unresolvedChanges(db).size} names the graph found no variable for in ${Date.now() - readingSince} ms`);
-  while (queue.length) {
-    const path = /** @type {string} */ (queue.shift());
-    const member = /** @type {{ member: string }} */ (db.prepare(`SELECT member FROM files WHERE path = ?`).get(path)).member;
-    // Copies of a member in several folders would all write programs/<member>.js.
-    const twin = programs.find((p) => p.member === member) ?? failures.find((f) => f.member === member);
-    if (twin) {
-      progress(`skipping ${path}: ${member} is already translated from ${twin.path}`);
+  // What the transactions and jobs call is queued before the rest, so a member in several folders is the copy the graph linked the
+  // call to, not the first by path.
+  let at = 0;
+  let rest = 0;
+  while (at < queue.length || rest < allPrograms.length) {
+    if (at === queue.length) {
+      const next = allPrograms[rest++];
+      if (!done.has(next)) queue.push(next);
+      done.add(next);
       continue;
     }
+    const path = queue[at++];
+    const member = /** @type {{ member: string }} */ (memberOf.get(path)).member;
+    // Copies of a member in several folders would all write programs/<member>.js.
+    const twin = pathOfTranslated.get(member);
+    if (twin) {
+      progress(`skipping ${path}: ${member} is already translated from ${twin}`);
+      continue;
+    }
+    pathOfTranslated.set(member, path);
     const started = Date.now();
-    progress(`translating ${path} (${programs.length + failures.length + 1} of ${done.size})`);
+    progress(`translating ${path} (${programs.length + failures.length + 1} of at most ${done.size + allPrograms.length - rest})`);
     let translated;
     try {
       translated = programToJs(db, root, indexer, path, progress);
@@ -3488,20 +3555,44 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
   /** @type {Map<string, string>} the MFS file of each screen module, one per name when the repo keeps copies */
   const screenFiles = new Map();
   const generated = [];
+  const programOfPath = new Map(programs.map((p) => [p.path, p]));
+  const failureOfPath = new Map(failures.map((f) => [f.path, f]));
   for (const transaction of transactions) {
     const path = pathOfMember(transaction.program);
-    const program = programs.find((p) => p.path === path);
+    const program = programOfPath.get(path);
     if (!program) {
-      const failed = failures.find((f) => f.path === path);
+      const failed = failureOfPath.get(path);
       if (failed) skipped.push({ code: transaction.code, program: transaction.program, why: `translating ${failed.path} failed` });
       continue;
     }
-    // Of copies of the screen in several folders, the one beside the program.
-    const input = inputs.filter((i) => i.code === transaction.code).sort((a, b) => sharedPrefix(b.path, path) - sharedPrefix(a.path, path))[0];
+    // The screen sending its code, else the one named like the code or the program. Of copies in several folders, the one beside the program.
+    const sending = inputsOfCode.get(transaction.code) ?? [];
+    const named = [screenOf(transaction.code), screenOf(transaction.program)].flatMap((s) => inputsOfScreen.get(s ?? "") ?? []);
+    const input = [...(sending.length ? sending : named)].sort((a, b) => sharedPrefix(b.path, path) - sharedPrefix(a.path, path))[0];
     const screen = input && (input.path.split("/").pop() ?? input.path);
     if (screen && !screenFiles.has(screen)) screenFiles.set(screen, input.path);
-    progress(`transaction ${transaction.code} runs ${path}${input ? ` from the screen ${screenFiles.get(/** @type {string} */ (screen))} ${input.message}` : ", no input screen starts with its code"}`);
+    progress(
+      `transaction ${transaction.code} runs ${path}${
+        input ? ` from the screen ${screenFiles.get(/** @type {string} */ (screen))} ${input.message}${sending.length ? "" : ", named like it"}` : ", no input screen sends its code or is named like it"
+      }`,
+    );
     generated.push({ ...transaction, entry: transaction.program, program, input, screen });
+  }
+  // A screen no transaction uses may still be sent by another screen's program, or a terminal user types its code. Copies of a
+  // used screen in other folders are used too.
+  /** @param {{ path: string, message: string }} i */
+  const screenKey = (i) => `${i.path.split("/").pop() ?? i.path} ${i.message}`;
+  const used = new Set(generated.flatMap((t) => (t.input ? [screenKey(t.input)] : [])));
+  for (const i of jobs || paths ? [] : inputs) {
+    if (used.has(screenKey(i))) continue;
+    used.add(screenKey(i));
+    const name = i.path.split("/").pop() ?? i.path;
+    if (!screenFiles.has(name)) screenFiles.set(name, i.path);
+    progress(
+      `[PLG088W] no transaction uses the input screen ${i.path} ${i.message}: ${
+        i.code ? `no PL/I program is named like the code ${i.code} it sends or differs from it only in the third character, and ` : ""
+      }no main program is named like the screen (${i.message.slice(0, 2)}?${i.message.slice(3, 6)}xx for ${i.message.slice(0, 6)}); it is generated without one`,
+    );
   }
 
   for (const [name, path] of screenFiles) {
@@ -3588,14 +3679,16 @@ export function generateJs(db, root, indexer, outDir, { templates, tn3270 = join
   const failed = new Set(failures.map((x) => x.path));
   for (const f of pliFiles) {
     if (f.used || translatedFrom.get(f.member) === f.path) continue;
-    const twin = translatedFrom.has(f.member) ? { path: translatedFrom.get(f.member) } : undefined;
+    const twin = pathOfTranslated.get(f.member);
     const why = failed.has(f.path)
       ? "translating it failed"
       : twin
-        ? `a copy of ${f.member}, translated from ${twin.path}`
+        ? `a copy of ${f.member}, ${failed.has(twin) ? "whose translation from" : "translated from"} ${twin}${failed.has(twin) ? " failed" : ""}`
         : f.included
           ? "an include no translated program includes"
-          : "no transaction, job or translated program reaches it";
+          : jobs || paths
+            ? "no transaction, job or translated program reaches it"
+            : "no procedure, and no program includes it";
     untranslated.push({ path: f.path, why });
   }
   progress(`${untranslated.length} of ${pliFiles.length} PL/I files are not translated${untranslated.length ? ":" : ""}`);

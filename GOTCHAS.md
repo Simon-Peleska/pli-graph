@@ -278,6 +278,23 @@
   caller-less refs and no unresolved writes, so it never shows this.
 - **The watcher and the indexer ignore `generated/`,** so editing the
   generated code by hand does not sync anything.
+- **A screen is named like its program by the first three digits only, not the
+  member.** The transaction `ABS00100` shows the screen `ABF001` (messages
+  `ABF001I`/`ABF001O`). Only a member name follows the 8-character rule, and
+  the MFS member holding `ABF001` may be called anything. So Generate
+  JavaScript matches the message names, not the files. Real screens often
+  send no code as their first `MFLD`. Matching only by that code left 97% of
+  the screens out.
+- **Generate JavaScript translates every program, not only what transactions
+  reach.** Message programs called through IMS Connect have no screen and
+  often no `TRANSACT` in the repo. Choosing the roots from transactions left
+  two thirds of a real repo out, without a warning.
+- **Transaction codes of programs without a screen are guesses.** Every
+  main program no job in the repo runs becomes a transaction, coded by its
+  name or with the type letter screens teach (`ABS00100` → `ABK00100`). A
+  batch program started from JCL outside the repo, or through an `IKJEFT01`
+  step the indexer can't resolve, becomes one too. Don't read those codes as
+  real IMS ones.
 
 ## The cgr patch set (`patches/`, no longer used by the extension)
 
